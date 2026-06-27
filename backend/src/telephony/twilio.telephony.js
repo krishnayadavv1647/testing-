@@ -225,10 +225,13 @@ export const TwilioTelephony = {
         greetingLength: greeting.length
       });
 
+      // Speak the greeting with Twilio's native <Say> BEFORE connecting the media stream,
+      // so the caller never hears silence on pickup. This deliberately does not depend on
+      // Kie/ElevenLabs TTS — if the custom TTS provider is broken, the greeting still plays.
       const streamUrl = `${mediaWsUrl.replace(/\/+$/, "")}/media`;
       return {
         contentType: "text/xml",
-        body: `<Response><Connect><Stream url="${escapeXml(streamUrl)}"><Parameter name="agentId" value="${escapeXml(String(agent?._id || ""))}" /><Parameter name="telephonyConfigId" value="${escapeXml(String(config?._id || ""))}" /><Parameter name="greeting" value="${escapeXml(greeting)}" /></Stream></Connect></Response>`
+        body: `<Response><Say voice="alice">${escapeXml(greeting)}</Say><Connect><Stream url="${escapeXml(streamUrl)}"><Parameter name="agentId" value="${escapeXml(String(agent?._id || ""))}" /><Parameter name="telephonyConfigId" value="${escapeXml(String(config?._id || ""))}" /></Stream></Connect></Response>`
       };
     }
 

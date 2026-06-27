@@ -135,15 +135,12 @@ async function handleStart(ws, session, message) {
   session.callSid = message.start?.callSid;
   session.agentId = message.start?.customParameters?.agentId;
   session.telephonyConfigId = message.start?.customParameters?.telephonyConfigId;
-  session.greeting = message.start?.customParameters?.greeting || null;
 
   console.log("[MediaStream] Twilio WS start", {
     streamSid: session.streamSid,
     callSid: session.callSid,
     agentId: session.agentId,
-    telephonyConfigId: session.telephonyConfigId,
-    hasGreeting: Boolean(session.greeting),
-    greetingLength: session.greeting?.length || 0
+    telephonyConfigId: session.telephonyConfigId
   });
 
   try {
@@ -225,35 +222,10 @@ async function handleStart(ws, session, message) {
     return;
   }
 
-  // Speak the greeting immediately after Deepgram is ready, so the caller hears
-  // the agent speak first without having to say anything.
-  if (session.greeting && !session.hasPlayedGreeting) {
-    session.hasPlayedGreeting = true;
-    try {
-      console.log(`[MediaStream:${session.streamSid}] Initial greeting TTS requested`, {
-        textLength: session.greeting.length
-      });
-
-      const audio = await synthesizeSpeech({ text: session.greeting });
-
-      await streamAudioBufferToTwilio(ws, session, audio);
-
-      console.log(`[MediaStream:${session.streamSid}] Initial greeting played`, {
-        bytes: audio?.length || 0
-      });
-    } catch (error) {
-      // Greeting failure is non-fatal — the call stays open so the caller can still speak
-      // and STT/transcript debugging continues working.
-      console.error(`[MediaStream:${session.streamSid}] Initial greeting TTS failed`, {
-        provider: process.env.CUSTOM_TTS_PROVIDER || null,
-        code: error?.details?.code || error?.code || null,
-        message: error?.message,
-        statusCode: error?.statusCode,
-        details: error?.details,
-        stack: error?.stack
-      });
-    }
-  }
+  // NOTE: The initial greeting is spoken by Twilio's native <Say> in the TwiML (see
+  // twilio.telephony.js custom_ai branch), BEFORE this media stream connects. We intentionally
+  // do NOT synthesize the greeting via Kie/ElevenLabs here, so a broken custom TTS provider
+  // can never make the call silent on pickup.
 }
 
 function handleMedia(ws, session, message) {
@@ -330,15 +302,13 @@ export function attachMediaStreamServer(httpServer) {
       callSid: null,
       agentId: null,
       telephonyConfigId: null,
-      greeting: null,
       deepgram: null,
       speaking: false,
       playbackId: 0,
       fallbackTriggered: false,
       closed: false,
       mediaFrameCount: 0,
-      transcriptCount: 0,
-      hasPlayedGreeting: false
+      transcriptCount: 0
     };
 
     ws.on("message", (message) => handleMessage(ws, session, message));
