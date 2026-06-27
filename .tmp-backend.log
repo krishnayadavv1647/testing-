@@ -1,0 +1,19 @@
+
+> ai-voice-agent-backend@1.0.0 dev
+> nodemon src/server.js
+
+[33m[nodemon] 3.1.14[39m
+[33m[nodemon] to restart at any time, enter `rs`[39m
+[33m[nodemon] watching path(s): *.*[39m
+[33m[nodemon] watching extensions: js,mjs,cjs,json[39m
+[32m[nodemon] starting `node src/server.js`[39m
+Database connected
+[MediaStream] Twilio media WebSocket server attached at /media
+[Scheduled Calls] worker started
+[Campaign Worker] started { intervalSeconds: 10 }
+[Follow-ups] worker started
+[Pipeline] Starting auto-pipeline scheduler (every 60s)
+AI Voice Agent API running on port 5000
+[Scheduled Calls] due calls found { count: 0 }
+[0mGET /api/email/unread-count [36m304[0m 1382.136 ms - -[0m
+Telegram bot started with node-telegram-bot-api

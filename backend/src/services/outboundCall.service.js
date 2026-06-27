@@ -1,0 +1,400 @@
+import CallLog from "../models/CallLog.js";
+import TelephonyConfig from "../models/TelephonyConfig.js";
+import { applyCallOutcomeToLog } from "./callOutcome.service.js";
+import { extractCallFields, extractRunId } from "./callLogMapper.js";
+import { scheduleDograhStatusSync } from "./dograhCallStatusSync.service.js";
+import { triggerDograhOutboundCallByWorkflow } from "./dograh.service.js";
+import { getDograhClientForAgent } from "./dograhClientResolver.js";
+import { getDograhLLMRuntimeSummary } from "./dograhLLMConfigSync.service.js";
+import { assertDograhVoiceReadyForWebCall } from "./dograhVoiceConfigSync.service.js";
+import { assertRuntimeVerification, verifyDograhWorkflowRuntime } from "./dograhWorkflowConfig.service.js";
+import { reserveVoiceCallBilling, releaseVoiceReservation } from "./billing/voiceCallBilling.service.js";
+import { getTelephonyProvider } from "../telephony/index.js";
+import { ApiError } from "../utils/apiError.js";
+
+function assertE164(value, fieldName) {
+  if (!value || !/^\+[1-9]\d{7,14}$/.test(value)) {
+    throw new ApiError(
+      400,
+      `${fieldName} must be in E.164 format, for example +17578297060`
+    );
+  }
+}
+
+function getDograhWebhookUrl() {
+  const backendUrl = process.env.PUBLIC_BACKEND_URL?.trim().replace(/\/$/, "");
+
+  if (!backendUrl) {
+    throw new ApiError(
+      500,
+      "PUBLIC_BACKEND_URL is missing. Set it to your deployed backend URL."
+    );
+  }
+
+  if (backendUrl.includes("localhost") || backendUrl.includes("127.0.0.1")) {
+    throw new ApiError(
+      500,
+      "PUBLIC_BACKEND_URL must be a deployed public backend URL, not localhost."
+    );
+  }
+
+  const webhookUrl = `${backendUrl}/api/webhooks/dograh`;
+
+  if (webhookUrl.includes("localhost") || webhookUrl.includes("127.0.0.1")) {
+    throw new ApiError(
+      500,
+      "Generated webhook URL is invalid because it contains localhost or 127.0.0.1."
+    );
+  }
+
+  return webhookUrl;
+}
+
+function publicBackendBaseUrl() {
+  const backendUrl = process.env.PUBLIC_BACKEND_URL?.trim().replace(/\/$/, "");
+
+  if (!backendUrl) {
+    throw new ApiError(
+      500,
+      "PUBLIC_BACKEND_URL is missing. Set it to your deployed backend URL."
+    );
+  }
+
+  if (!backendUrl.startsWith("https://") || backendUrl.includes("localhost") || backendUrl.includes("127.0.0.1")) {
+    throw new ApiError(
+      500,
+      "PUBLIC_BACKEND_URL must be a deployed public HTTPS backend URL, not localhost."
+    );
+  }
+
+  return backendUrl;
+}
+
+function customTelephonyWebhookUrl(telephonyConfig, agent) {
+  const params = new URLSearchParams({
+    telephonyConfigId: telephonyConfig._id.toString(),
+    agentId: agent._id.toString(),
+    inboundMode: "custom_ai"
+  });
+
+  return `${publicBackendBaseUrl()}/api/telephony/${encodeURIComponent(telephonyConfig.provider)}/incoming?${params.toString()}`;
+}
+
+function firstSpokenMessage(agent) {
+  const message = [agent?.firstMessage, agent?.greetingMessage]
+    .find((item) => item && String(item).trim());
+
+  return String(message || `Hello, welcome to ${agent?.businessName || "our business"}. How can I help you today?`).trim();
+}
+
+function dograhCallPayload(agent, phoneNumber, metadata = {}) {
+  const webhookUrl = getDograhWebhookUrl();
+  const openingMessage = firstSpokenMessage(agent);
+
+  return {
+    phone_number: phoneNumber,
+    calling_number: agent.callerIdNumber,
+    webhook_url: webhookUrl,
+    first_message: openingMessage,
+    initial_message: openingMessage,
+    greeting_message: openingMessage,
+    message: openingMessage,
+    start_message: openingMessage,
+    welcome_message: openingMessage,
+    speak_first: true,
+    agent_speaks_first: true,
+    initial_speaker: "agent",
+    call_direction: "outbound",
+    is_outbound: true,
+
+    initial_context: {
+      businessName: agent.businessName,
+      agentName: agent.agentName,
+      firstMessage: openingMessage,
+      greetingMessage: openingMessage,
+      localAgentId: agent._id.toString(),
+      userId: agent.userId.toString(),
+      ...metadata,
+    },
+
+    metadata: {
+      localAgentId: agent._id.toString(),
+      userId: agent.userId.toString(),
+      dograhWorkflowUuid: agent.dograhWorkflowUuid,
+      webhookUrl,
+      firstMessage: openingMessage,
+      ...metadata,
+    },
+  };
+}
+
+function publicCallLog(callLog) {
+  const value = callLog?.toObject ? callLog.toObject() : { ...(callLog || {}) };
+  delete value.providerPayload;
+  delete value.rawDograhPayload;
+  delete value.rawWebhookPayload;
+  return value;
+}
+
+export async function triggerCustomOutboundCallForAgent({
+  agent,
+  userId,
+  phoneNumber,
+  source = "custom"
+}) {
+  if (!phoneNumber) {
+    throw new ApiError(
+      400,
+      "phoneNumber is required before triggering a custom call."
+    );
+  }
+
+  assertE164(phoneNumber, "Phone number");
+
+  const telephonyConfig = await TelephonyConfig.findOne({
+    linkedAgentId: agent._id,
+    status: "active"
+  });
+
+  if (!telephonyConfig) {
+    throw new ApiError(400, "No active telephony configuration is linked to this agent.");
+  }
+
+  if (telephonyConfig.outboundEnabled === false) {
+    throw new ApiError(400, "Outbound calling is disabled for this telephony configuration.");
+  }
+
+  const provider = getTelephonyProvider(telephonyConfig.provider);
+  const webhookUrl = customTelephonyWebhookUrl(telephonyConfig, agent);
+  const response = await provider.makeCall(telephonyConfig, { phoneNumber, webhookUrl });
+  const rawProviderStatus = response.status || "initiated";
+
+  const callLog = await CallLog.create({
+    userId,
+    agentId: agent._id,
+    callerNumber: phoneNumber,
+    callingNumber: telephonyConfig.phoneNumber,
+    status: rawProviderStatus,
+    rawProviderStatus,
+    providerPayload: response,
+    callDirection: "outbound",
+    source,
+    telephonyConfigId: telephonyConfig._id,
+    duration: null,
+    durationSeconds: null,
+    summary: null,
+    transcript: null,
+    startedAt: new Date()
+  });
+  await applyCallOutcomeToLog(callLog, rawProviderStatus);
+  await callLog.save();
+
+  console.log("Custom call triggered:", {
+    localAgentId: agent._id.toString(),
+    telephonyConfigId: telephonyConfig._id.toString(),
+    provider: telephonyConfig.provider,
+    callerNumber: phoneNumber,
+    callingNumber: telephonyConfig.phoneNumber,
+    rawProviderStatus,
+    webhookUrl
+  });
+
+  return {
+    callLog,
+    publicCallLog: publicCallLog(callLog)
+  };
+}
+
+// Consolidated pre-call / pre-publish readiness validation (no remote Dograh fetch).
+// Confirms the agent can place a call: workflow synced, voice + LLM verified, and (when
+// required) a phone number / caller ID present. Used by publish; the call triggers below
+// run this plus a live workflow read-back verification.
+export async function assertDograhAgentReadyForCalls({ agent, userId, requirePhone = false, phoneNumber }) {
+  if (agent?.provider !== "dograh") return;
+
+  const workflowId = agent.dograhWorkflowId || agent.providerWorkflowId;
+  if (!workflowId || !agent.dograhWorkflowUuid) {
+    throw new ApiError(400, "Dograh workflow sync must finish before this agent can place calls. Save the agent and wait until the workflow is synced.");
+  }
+  if (agent.workflowSyncStatus && agent.workflowSyncStatus !== "synced") {
+    throw new ApiError(400, agent.workflowSyncError || "Dograh workflow runtime sync is not complete yet. Save the agent and wait until sync is marked synced.");
+  }
+
+  try {
+    await assertDograhVoiceReadyForWebCall({ agent, userId: userId || agent.userId });
+  } catch (error) {
+    throw new ApiError(400, error.safeMessage || error.message || "The selected voice provider is not verified with Dograh yet.", { configurationRequired: true });
+  }
+
+  const llmRuntime = await getDograhLLMRuntimeSummary({ agent, userId: userId || agent.userId });
+  if (llmRuntime.requiresSync && llmRuntime.dograhSyncStatus !== "synced") {
+    throw new ApiError(400, llmRuntime.dograhSyncError || "Dograh LLM settings are not verified yet. Save the agent and wait until the LLM status is synced.", { llmRuntime });
+  }
+
+  if (requirePhone) {
+    if (!phoneNumber) throw new ApiError(400, "phoneNumber is required before triggering a Dograh call.");
+    if (!agent.callerIdNumber) throw new ApiError(400, "callerIdNumber is required before triggering calls.");
+    assertE164(phoneNumber, "Phone number");
+    assertE164(agent.callerIdNumber, "Caller ID number");
+  }
+}
+
+export async function triggerOutboundCallForAgent({
+  agent,
+  userId,
+  phoneNumber,
+  leadId,
+  source = "dograh",
+  metadata = {},
+  trigger = triggerDograhOutboundCallByWorkflow
+}) {
+  if (!agent?.dograhWorkflowUuid) {
+    throw new ApiError(
+      400,
+      "workflowUuid is required. Dograh workflow sync must finish before triggering calls."
+    );
+  }
+
+  if (!phoneNumber) {
+    throw new ApiError(
+      400,
+      "phoneNumber is required before triggering a Dograh call."
+    );
+  }
+
+  if (!agent.callerIdNumber) {
+    throw new ApiError(
+      400,
+      "callerIdNumber is required before triggering calls."
+    );
+  }
+
+  assertE164(phoneNumber, "Phone number");
+  assertE164(agent.callerIdNumber, "Caller ID number");
+
+  if (agent.workflowSyncStatus && agent.workflowSyncStatus !== "synced") {
+    throw new ApiError(400, agent.workflowSyncError || "Dograh workflow runtime sync is not complete. Save the agent and wait until sync is marked synced.");
+  }
+
+  const voiceRuntime = await assertDograhVoiceReadyForWebCall({ agent, userId: userId || agent.userId });
+  const llmRuntime = await getDograhLLMRuntimeSummary({ agent, userId: userId || agent.userId });
+  if (llmRuntime.requiresSync && llmRuntime.dograhSyncStatus !== "synced") {
+    throw new ApiError(400, llmRuntime.dograhSyncError || "Dograh LLM settings are not verified yet. Save the agent and wait until LLM status is synced.", {
+      llmRuntime
+    });
+  }
+  const workflowId = agent.dograhWorkflowId || agent.providerWorkflowId;
+  if (!workflowId) {
+    throw new ApiError(400, "dograhWorkflowId is required before triggering calls.");
+  }
+
+  const resolved = await getDograhClientForAgent(agent, userId || agent.userId);
+  const runtimeVerification = await verifyDograhWorkflowRuntime({
+    agent,
+    userId: userId || agent.userId,
+    callType: "outbound_phone_call",
+    fetchWorkflow: async () => {
+      try {
+        const response = await resolved.client.get(`/workflow/fetch/${encodeURIComponent(workflowId)}`);
+        return response.data;
+      } catch (error) {
+        if (error?.response?.status === 404) {
+          throw new ApiError(404, "Dograh workflow was not found for this agent. Re-sync the agent workflow, then retry the call.", {
+            code: "DOGRAH_WORKFLOW_NOT_FOUND"
+          });
+        }
+        throw error;
+      }
+    }
+  });
+  assertRuntimeVerification(runtimeVerification);
+
+  // Credit gating (Phase 1): reserve estimated per-minute cost before placing the call. Blocks
+  // here (no Dograh call made) if the wallet can't cover it. No-op unless CREDIT_ENFORCEMENT=true.
+  const billing = await reserveVoiceCallBilling({ userId: userId || agent.userId, agent });
+  if (billing.blocked) {
+    throw new ApiError(402, billing.message || "Insufficient platform credits to place this call.", {
+      code: "INSUFFICIENT_CREDITS"
+    });
+  }
+
+  const payload = dograhCallPayload(agent, phoneNumber, metadata);
+  let dograhResponse;
+  try {
+    dograhResponse = await trigger(agent.dograhWorkflowUuid, payload, { userId: userId || agent.userId, agent });
+  } catch (error) {
+    // The call never started — return the held credits.
+    if (billing.enforced) await releaseVoiceReservation(billing.billingCallId);
+    throw error;
+  }
+  const dograhRunId = extractRunId(dograhResponse);
+  const responseFields = extractCallFields(dograhResponse);
+
+  console.log("Dograh trigger accepted:", {
+    localAgentId: agent._id.toString(),
+    workflowId,
+    workflowUuid: agent.dograhWorkflowUuid,
+    dograhRunId: dograhRunId ? String(dograhRunId) : null,
+    rawProviderStatus: dograhResponse?.status || dograhResponse?.data?.status || "initiated"
+  });
+  if (!dograhRunId) {
+    console.warn("Dograh run ID missing in trigger response. CallLog will be created, but manual sync needs a run ID.");
+  }
+
+  const rawProviderStatus = dograhResponse?.status || dograhResponse?.data?.status || "initiated";
+  const callLog = await CallLog.create({
+    userId,
+    agentId: agent._id,
+    dograhWorkflowId: agent.dograhWorkflowId,
+    dograhWorkflowUuid: agent.dograhWorkflowUuid,
+    dograhRunId: dograhRunId ? String(dograhRunId) : null,
+    leadId,
+    campaignId: metadata.campaignId,
+    campaignRecipientId: metadata.campaignRecipientId,
+    callerNumber: phoneNumber,
+    callingNumber: agent.callerIdNumber,
+    status: rawProviderStatus,
+    rawProviderStatus,
+    providerPayload: dograhResponse,
+    callDirection: "outbound",
+    source,
+    duration: null,
+    durationSeconds: null,
+    summary: null,
+    transcript: null,
+    rawDograhPayload: dograhResponse,
+    startedAt: responseFields.startedAt || new Date(),
+    billingEnforced: Boolean(billing.enforced),
+    billingMode: billing.enforced ? billing.billingMode : null,
+    billingCallId: billing.enforced ? billing.billingCallId : null,
+  });
+  await applyCallOutcomeToLog(callLog, rawProviderStatus);
+  await callLog.save();
+  scheduleDograhStatusSync(callLog._id);
+
+  console.log("Dograh call triggered:", {
+    localAgentId: agent._id.toString(),
+    workflowId,
+    dograhWorkflowUuid: agent.dograhWorkflowUuid,
+    dograhConnectionType: agent.dograhConnectionType || "platform",
+    dograhIntegrationId: agent.dograhIntegrationId ? String(agent.dograhIntegrationId) : null,
+    dograhRunId,
+    callerNumber: phoneNumber,
+    callingNumber: agent.callerIdNumber,
+    effectiveLlmProvider: llmRuntime?.effectiveProvider,
+    effectiveLlmModel: llmRuntime?.effectiveModel,
+    effectiveTtsProvider: voiceRuntime?.effectiveTtsProvider,
+    effectiveTtsModel: voiceRuntime?.effectiveTtsModel,
+    effectiveSttProvider: voiceRuntime?.effectiveSttProvider,
+    verificationResult: runtimeVerification.ok
+  });
+
+  return {
+    dograhResponse: {
+      status: rawProviderStatus,
+      dograhRunId: dograhRunId ? String(dograhRunId) : null
+    },
+    callLog,
+    publicCallLog: publicCallLog(callLog)
+  };
+}
