@@ -1,6 +1,6 @@
 import express from "express";
 
-import { ttsHealthCheck } from "../controllers/health.controller.js";
+import { runtimeDebug, ttsHealthCheck } from "../controllers/health.controller.js";
 import { protect, requireAdmin } from "../middleware/auth.middleware.js";
 
 const router = express.Router();

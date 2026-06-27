@@ -1,6 +1,9 @@
 import { synthesizeSpeech } from "../voice/tts/index.js";
 import { resolveLiveTtsProvider, getTtsRuntimeSummary } from "../voice/tts/provider.js";
 
+// Module-level start time so the runtime endpoint can report uptime.
+const SERVICE_STARTED_AT = new Date().toISOString();
+
 const DEFAULT_HEALTH_TEXT = "Hello, this is a TTS health check.";
 const SECRET_KEY_PATTERN = /(authorization|api[_-]?key|secret|token|password|bearer)/i;
 
@@ -24,6 +27,39 @@ function sanitizeDetails(value, depth = 0) {
   }
   if (typeof value === "string" && value.length > 2000) return `${value.slice(0, 2000)}…[truncated]`;
   return value;
+}
+
+/**
+ * GET /api/debug/runtime — safe, unauthenticated snapshot of the running backend's config.
+ * No secrets. Used to confirm which deployed instance (Render vs local) Twilio is hitting,
+ * and to verify env vars are present without revealing their values.
+ */
+export function runtimeDebug(req, res) {
+  let resolvedProvider = null;
+  let providerError = null;
+
+  try {
+    resolvedProvider = resolveLiveTtsProvider();
+  } catch (error) {
+    providerError = error.details?.code || error.message;
+  }
+
+  res.status(200).json({
+    success: true,
+    service: "AI Voice Agent Backend",
+    environment: process.env.NODE_ENV || null,
+    startedAt: SERVICE_STARTED_AT,
+    gitCommit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null,
+    publicMediaWsUrlConfigured: Boolean(process.env.PUBLIC_MEDIA_WS_URL),
+    publicMediaWsUrl: process.env.PUBLIC_MEDIA_WS_URL || null,
+    ttsProvider: resolvedProvider,
+    ttsProviderError: providerError,
+    kieEnabled: process.env.KIE_TTS_ENABLED === "true",
+    hasKieApiKey: Boolean(process.env.KIE_API_KEY),
+    hasDeepgramApiKey: Boolean(process.env.DEEPGRAM_API_KEY),
+    callDebugTranscriptOnly: process.env.CALL_DEBUG_TRANSCRIPT_ONLY === "true",
+    debugSttInterim: process.env.DEBUG_STT_INTERIM === "true"
+  });
 }
 
 /**

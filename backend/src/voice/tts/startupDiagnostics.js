@@ -70,6 +70,16 @@ export function runTtsStartupDiagnostics(env = process.env) {
   }
   if (!summary.hasPublicMediaWsUrl) {
     console.error("[TTS Runtime] PUBLIC_MEDIA_WS_URL is missing — Twilio cannot open the media stream WebSocket for live calls.");
+  } else if (env.PUBLIC_MEDIA_WS_URL?.includes("/media")) {
+    console.warn("[Config Warning] PUBLIC_MEDIA_WS_URL should not include /media — the backend appends /media automatically. Use only wss://your-domain.com");
+  }
+
+  // Debug mode flags
+  if (env.CALL_DEBUG_TRANSCRIPT_ONLY === "true") {
+    console.warn("[TTS Runtime] CALL_DEBUG_TRANSCRIPT_ONLY=true — TTS responses are suppressed; call stays open for transcript debugging only.");
+  }
+  if (env.DEBUG_STT_INTERIM === "true") {
+    console.warn("[TTS Runtime] DEBUG_STT_INTERIM=true — Deepgram interim transcripts will be logged.");
   }
 
   return summary;

@@ -130,28 +130,68 @@ function cleanUpSession(session) {
   session.telephonyConfigId = null;
 }
 
-function handleStart(ws, session, message) {
+async function handleStart(ws, session, message) {
   session.streamSid = message.start?.streamSid || message.streamSid;
   session.callSid = message.start?.callSid;
   session.agentId = message.start?.customParameters?.agentId;
   session.telephonyConfigId = message.start?.customParameters?.telephonyConfigId;
+  session.greeting = message.start?.customParameters?.greeting || null;
+
+  console.log("[MediaStream] Twilio WS start", {
+    streamSid: session.streamSid,
+    callSid: session.callSid,
+    agentId: session.agentId,
+    telephonyConfigId: session.telephonyConfigId,
+    hasGreeting: Boolean(session.greeting),
+    greetingLength: session.greeting?.length || 0
+  });
 
   try {
     session.deepgram = createDeepgramLiveTranscriber({
+      metadata: { streamSid: session.streamSid, callSid: session.callSid },
       onFinalTranscript: async (text) => {
         if (session.closed) return;
 
+        session.transcriptCount = (session.transcriptCount || 0) + 1;
+
+        console.log("[Caller Transcript]", {
+          streamSid: session.streamSid,
+          callSid: session.callSid,
+          agentId: session.agentId,
+          telephonyConfigId: session.telephonyConfigId,
+          transcriptCount: session.transcriptCount,
+          text
+        });
         console.log(`[MediaStream:${session.streamSid}] Transcript: ${text}`);
 
+        // CALL_DEBUG_TRANSCRIPT_ONLY=true: log transcripts, skip TTS, keep call open.
+        // Use this to verify STT works independently of TTS.
+        if (process.env.CALL_DEBUG_TRANSCRIPT_ONLY === "true") {
+          console.log("[Call Debug] Transcript-only mode; skipping TTS response.", {
+            streamSid: session.streamSid,
+            text
+          });
+          return;
+        }
+
         try {
-          // NOTE: This is echo/demo mode — it synthesizes the caller's own transcript straight
-          // back to speech. It does NOT run the agent LLM. To make this a real conversation,
-          // route `text` through the custom agent runtime (e.g. runCustomAgent) and synthesize
-          // the agent's reply instead. Left intentionally as echo for now; see TODO.
-          // TODO(custom_ai): connect runCustomAgent so live calls reply with agent output,
-          // not an echo of the caller.
-          console.log(`[MediaStream:${session.streamSid}] TTS echo requested`);
+          // NOTE: Echo/demo mode — synthesizes the caller's own transcript back to speech.
+          // Does NOT run the agent LLM.
+          // TODO(custom_ai): route `text` through runCustomAgent and synthesize the agent's
+          // reply instead, so the live call becomes a real conversation.
+          const provider = getTtsRuntimeSummary().provider;
+          console.log(`[MediaStream:${session.streamSid}] TTS requested`, {
+            provider,
+            textLength: text.length
+          });
+
           const audio = await synthesizeSpeech({ text });
+
+          console.log(`[MediaStream:${session.streamSid}] TTS success`, {
+            provider,
+            bytes: audio?.length || 0
+          });
+
           await streamAudioBufferToTwilio(ws, session, audio);
         } catch (error) {
           const provider = getTtsRuntimeSummary().provider;
@@ -175,9 +215,44 @@ function handleStart(ws, session, message) {
       }
     });
   } catch (error) {
-    console.error(`[MediaStream:${session.streamSid || "unknown"}] Failed to start Deepgram`, error.message);
+    console.error(`[MediaStream:${session.streamSid || "unknown"}] Failed to start Deepgram`, {
+      message: error.message,
+      code: error?.code,
+      stack: error?.stack
+    });
     session.closed = true;
     ws.close();
+    return;
+  }
+
+  // Speak the greeting immediately after Deepgram is ready, so the caller hears
+  // the agent speak first without having to say anything.
+  if (session.greeting && !session.hasPlayedGreeting) {
+    session.hasPlayedGreeting = true;
+    try {
+      console.log(`[MediaStream:${session.streamSid}] Initial greeting TTS requested`, {
+        textLength: session.greeting.length
+      });
+
+      const audio = await synthesizeSpeech({ text: session.greeting });
+
+      await streamAudioBufferToTwilio(ws, session, audio);
+
+      console.log(`[MediaStream:${session.streamSid}] Initial greeting played`, {
+        bytes: audio?.length || 0
+      });
+    } catch (error) {
+      // Greeting failure is non-fatal — the call stays open so the caller can still speak
+      // and STT/transcript debugging continues working.
+      console.error(`[MediaStream:${session.streamSid}] Initial greeting TTS failed`, {
+        provider: process.env.CUSTOM_TTS_PROVIDER || null,
+        code: error?.details?.code || error?.code || null,
+        message: error?.message,
+        statusCode: error?.statusCode,
+        details: error?.details,
+        stack: error?.stack
+      });
+    }
   }
 }
 
@@ -186,6 +261,19 @@ function handleMedia(ws, session, message) {
     session.playbackId += 1;
     sendClearToTwilio(ws, session.streamSid);
     session.speaking = false;
+  }
+
+  session.mediaFrameCount = (session.mediaFrameCount || 0) + 1;
+
+  // Log first frame and every 50th to confirm caller audio is reaching the backend.
+  if (session.mediaFrameCount === 1 || session.mediaFrameCount % 50 === 0) {
+    console.log(`[MediaStream:${session.streamSid}] Twilio media frames received`, {
+      count: session.mediaFrameCount,
+      hasPayload: Boolean(message.media?.payload),
+      payloadLength: message.media?.payload?.length || 0,
+      hasDeepgram: Boolean(session.deepgram),
+      callSid: session.callSid
+    });
   }
 
   const payload = message.media?.payload;
@@ -204,7 +292,16 @@ function handleMessage(ws, session, rawMessage) {
   }
 
   if (message.event === "start") {
-    handleStart(ws, session, message);
+    // handleStart is async; fire-and-forget with a top-level catch so one bad call
+    // cannot crash the WebSocket server.
+    handleStart(ws, session, message).catch((error) => {
+      console.error(`[MediaStream:${session.streamSid || "unknown"}] handleStart failed`, {
+        message: error?.message,
+        code: error?.code,
+        statusCode: error?.statusCode,
+        stack: error?.stack
+      });
+    });
     return;
   }
 
@@ -221,27 +318,47 @@ function handleMessage(ws, session, rawMessage) {
 export function attachMediaStreamServer(httpServer) {
   const mediaServer = new WebSocketServer({ server: httpServer, path: "/media" });
 
-  mediaServer.on("connection", (ws) => {
+  mediaServer.on("connection", (ws, req) => {
+    console.log("[MediaStream] Twilio WebSocket connected", {
+      url: req?.url,
+      remoteAddress: req?.socket?.remoteAddress,
+      userAgent: req?.headers?.["user-agent"]
+    });
+
     const session = {
       streamSid: null,
       callSid: null,
       agentId: null,
       telephonyConfigId: null,
+      greeting: null,
       deepgram: null,
       speaking: false,
       playbackId: 0,
       fallbackTriggered: false,
-      closed: false
+      closed: false,
+      mediaFrameCount: 0,
+      transcriptCount: 0,
+      hasPlayedGreeting: false
     };
 
     ws.on("message", (message) => handleMessage(ws, session, message));
 
-    ws.on("close", () => {
+    ws.on("close", (code, reason) => {
+      console.log(`[MediaStream:${session.streamSid || "unknown"}] WebSocket closed`, {
+        code,
+        reason: reason?.toString() || null,
+        callSid: session.callSid,
+        mediaFrameCount: session.mediaFrameCount,
+        transcriptCount: session.transcriptCount
+      });
       cleanUpSession(session);
     });
 
     ws.on("error", (error) => {
-      console.error(`[MediaStream:${session.streamSid || "unknown"}] WebSocket error`, error.message);
+      console.error(`[MediaStream:${session.streamSid || "unknown"}] WebSocket error`, {
+        message: error?.message,
+        stack: error?.stack
+      });
       cleanUpSession(session);
     });
   });

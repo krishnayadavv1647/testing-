@@ -176,13 +176,7 @@ export const TwilioTelephony = {
     }
   },
 
-  handleIncomingCall({ reply, agent, config }) {
-    console.log("[Twilio Inbound]", {
-      inboundMode: config?.inboundMode,
-      hasDograhWebhook: Boolean(config?.dograhInboundWebhookUrl),
-      hasMediaWsUrl: Boolean(process.env.PUBLIC_MEDIA_WS_URL),
-      mediaWsUrl: process.env.PUBLIC_MEDIA_WS_URL || "(unset)"
-    });
+  handleIncomingCall({ req, reply, agent, config }) {
 
     const inboundMode = config?.inboundMode || (config?.inboundEnabled === false ? "disabled" : "dograh_ai");
 
@@ -210,10 +204,31 @@ export const TwilioTelephony = {
         return buildFailureResponse("Our voice system is temporarily misconfigured. Please try again shortly.");
       }
 
+      const to = req?.body?.To || req?.query?.To || "";
+      const from = req?.body?.From || req?.query?.From || "";
+
+      // Build greeting: use agent.firstMessage, then greetingMessage, then fallback.
+      // reply is already resolved from those fields by the controller before calling here.
+      const rawGreeting = reply || agent?.firstMessage || agent?.greetingMessage || "Hello, how can I help you today?";
+      const greeting = String(rawGreeting).trim().slice(0, 500);
+
+      console.log("[Twilio Inbound]", {
+        to: to ? maskPhone(to) : null,
+        from: from ? maskPhone(from) : null,
+        inboundMode,
+        hasAgent: Boolean(agent),
+        agentId: agent?._id?.toString() || null,
+        telephonyConfigId: config?._id?.toString() || null,
+        hasMediaWsUrl: Boolean(mediaWsUrl),
+        mediaWsUrl,
+        hasGreeting: Boolean(greeting),
+        greetingLength: greeting.length
+      });
+
       const streamUrl = `${mediaWsUrl.replace(/\/+$/, "")}/media`;
       return {
         contentType: "text/xml",
-        body: `<Response><Connect><Stream url="${escapeXml(streamUrl)}"><Parameter name="agentId" value="${escapeXml(agent?._id || "")}" /><Parameter name="telephonyConfigId" value="${escapeXml(config?._id || "")}" /></Stream></Connect></Response>`
+        body: `<Response><Connect><Stream url="${escapeXml(streamUrl)}"><Parameter name="agentId" value="${escapeXml(String(agent?._id || ""))}" /><Parameter name="telephonyConfigId" value="${escapeXml(String(config?._id || ""))}" /><Parameter name="greeting" value="${escapeXml(greeting)}" /></Stream></Connect></Response>`
       };
     }
 
@@ -224,6 +239,12 @@ export const TwilioTelephony = {
     };
   }
 };
+
+function maskPhone(value) {
+  const text = String(value || "");
+  if (text.length <= 5) return text ? "****" : "";
+  return `${text.slice(0, 3)}****${text.slice(-2)}`;
+}
 
 function buildFailureResponse(message) {
   return {

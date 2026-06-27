@@ -23,6 +23,7 @@ import dograhRoutes from "./routes/dograh.routes.js";
 import emailRoutes from "./routes/email.routes.js";
 import emailIntegrationRoutes from "./routes/emailIntegration.routes.js";
 import healthRoutes from "./routes/health.routes.js";
+import { runtimeDebug } from "./controllers/health.controller.js";
 import followUpRoutes from "./routes/followUp.routes.js";
 import importCallsRoutes from "./routes/importCalls.routes.js";
 import knowledgeRoutes from "./routes/knowledge.routes.js";
@@ -82,6 +83,10 @@ app.get("/api/health", (req, res) => {
 
 // Admin-only deep health checks (e.g. /api/health/tts)
 app.use("/api/health", healthRoutes);
+
+// Public runtime info — no secrets; confirms which deployed instance is running.
+// GET /api/debug/runtime -> { service, gitCommit, ttsProvider, hasKieApiKey, ... }
+app.get("/api/debug/runtime", runtimeDebug);
 
 // Routes
 app.use("/api/auth", authRoutes);
