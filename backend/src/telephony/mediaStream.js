@@ -4,12 +4,25 @@ import TelephonyConfig from "../models/TelephonyConfig.js";
 import { TwilioTelephony } from "./twilio.telephony.js";
 import { createDeepgramLiveTranscriber } from "../voice/stt/index.js";
 import { synthesizeSpeech } from "../voice/tts/index.js";
+import { getTtsRuntimeSummary } from "../voice/tts/provider.js";
 
 const TWILIO_MULAW_20MS_BYTES = 160;
 const TTS_FAILURE_FALLBACK_MESSAGE = "We're experiencing a technical issue, please try again shortly.";
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Provider response bodies (e.g. Kie's job result) carry no secrets, but can be large.
+// Cap the serialized size so a failure log stays readable.
+function safeProviderBody(body) {
+  if (body == null) return null;
+  try {
+    const json = JSON.stringify(body);
+    return json.length > 2000 ? `${json.slice(0, 2000)}…[truncated]` : body;
+  } catch {
+    return "[unserializable provider body]";
+  }
 }
 
 function sendClearToTwilio(ws, streamSid) {
@@ -131,25 +144,33 @@ function handleStart(ws, session, message) {
         console.log(`[MediaStream:${session.streamSid}] Transcript: ${text}`);
 
         try {
+          // NOTE: This is echo/demo mode — it synthesizes the caller's own transcript straight
+          // back to speech. It does NOT run the agent LLM. To make this a real conversation,
+          // route `text` through the custom agent runtime (e.g. runCustomAgent) and synthesize
+          // the agent's reply instead. Left intentionally as echo for now; see TODO.
+          // TODO(custom_ai): connect runCustomAgent so live calls reply with agent output,
+          // not an echo of the caller.
           console.log(`[MediaStream:${session.streamSid}] TTS echo requested`);
           const audio = await synthesizeSpeech({ text });
           await streamAudioBufferToTwilio(ws, session, audio);
         } catch (error) {
-          console.error(`[MediaStream:${session.streamSid}] TTS echo failed`, {
-            code: error?.code,
-            message: error?.message,
-            statusCode: error?.statusCode,
-            details: error?.details,
-            stack: error?.stack
-          });
+          const provider = getTtsRuntimeSummary().provider;
+          const fallbackReason = error?.details?.code || error?.details?.category || error?.message;
           console.error("[Technical Issue Fallback Triggered]", {
-            code: error?.code,
+            provider,
+            streamSid: session.streamSid || null,
+            callSid: session.callSid || null,
+            telephonyConfigId: session.telephonyConfigId || null,
+            agentId: session.agentId || null,
+            code: error?.details?.code || error?.code || null,
             message: error?.message,
-            statusCode: error?.statusCode,
+            statusCode: error?.statusCode || error?.details?.providerStatus || null,
             details: error?.details,
+            providerBody: safeProviderBody(error?.details?.providerBody),
+            fallbackReason,
             stack: error?.stack
           });
-          await playTwilioTtsFallback(ws, session, error.details?.category || error.message);
+          await playTwilioTtsFallback(ws, session, fallbackReason);
         }
       }
     });

@@ -3,6 +3,7 @@ import axios from "axios";
 import { ApiError } from "../../utils/apiError.js";
 import { ELEVENLABS_TTS_URL, logElevenLabsApiError } from "../../services/voiceProviders/elevenLabsDiagnostics.js";
 import { synthesizeSpeechWithKie } from "./kie.js";
+import { resolveLiveTtsProvider } from "./provider.js";
 
 function responseBody(error) {
   if (Buffer.isBuffer(error.response?.data)) return error.response.data.toString("utf8");
@@ -18,9 +19,14 @@ export async function synthesizeSpeech({
   text,
   apiKey = process.env.ELEVENLABS_API_KEY,
   voiceId = process.env.ELEVENLABS_DEFAULT_VOICE_ID,
-  provider = process.env.CUSTOM_TTS_PROVIDER || (process.env.KIE_TTS_ENABLED === "true" ? "kie" : "elevenlabs")
+  provider
 } = {}) {
-  if (provider === "kie") {
+  // Resolve provider via the single source of truth unless an explicit override is passed
+  // (e.g. the TTS health endpoint). Misconfiguration throws here with a clear code instead
+  // of silently defaulting.
+  const resolvedProvider = provider || resolveLiveTtsProvider();
+
+  if (resolvedProvider === "kie") {
     return synthesizeSpeechWithKie({ text, voice: process.env.KIE_TTS_VOICE });
   }
 

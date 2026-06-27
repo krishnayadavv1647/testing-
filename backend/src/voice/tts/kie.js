@@ -1,7 +1,7 @@
 import axios from "axios";
 
 import { ApiError } from "../../utils/apiError.js";
-import { inputFormatFromContentType, transcodeToMulaw8k } from "./audioTranscode.js";
+import { getFfmpegStatus, inputFormatFromContentType, transcodeToMulaw8k } from "./audioTranscode.js";
 
 const DEFAULT_KIE_BASE_URL = "https://api.kie.ai";
 const DEFAULT_KIE_CREATE_TASK_ENDPOINT = "/api/v1/jobs/createTask";
@@ -73,11 +73,17 @@ function normalizeKieCallbackUrl(rawUrl) {
   try {
     parsed = new URL(callbackUrl);
   } catch {
-    throw new ApiError(500, "KIE_TTS_CALLBACK_URL or KIE_CALLBACK_URL must be a valid public HTTPS URL.");
+    throw new ApiError(500, "KIE_TTS_CALLBACK_URL or KIE_CALLBACK_URL must be a valid public HTTPS URL.", {
+      code: "KIE_CALLBACK_URL_INVALID",
+      provider: "kie"
+    });
   }
 
   if (parsed.protocol !== "https:" || !parsed.hostname || callbackUrl.slice("https://".length).includes("://")) {
-    throw new ApiError(500, "KIE_TTS_CALLBACK_URL or KIE_CALLBACK_URL must be a valid public HTTPS URL.");
+    throw new ApiError(500, "KIE_TTS_CALLBACK_URL or KIE_CALLBACK_URL must be a valid public HTTPS URL.", {
+      code: "KIE_CALLBACK_URL_INVALID",
+      provider: "kie"
+    });
   }
 
   return callbackUrl;
@@ -97,8 +103,12 @@ function buildKieTtsInput({ text, voice }) {
     language_code: process.env.KIE_TTS_LANGUAGE_CODE || ""
   };
 
-  if (process.env.KIE_TTS_OUTPUT_FORMAT) {
-    input.output_format = process.env.KIE_TTS_OUTPUT_FORMAT;
+  // Only send output_format when explicitly configured and non-empty. Kie's ElevenLabs
+  // TTS models do not reliably honor it (they return audio/mpeg regardless), so leaving it
+  // unset avoids sending a parameter the provider may reject — we transcode to ulaw downstream.
+  const outputFormat = String(process.env.KIE_TTS_OUTPUT_FORMAT || "").trim();
+  if (outputFormat) {
+    input.output_format = outputFormat;
   }
 
   return input;
@@ -132,15 +142,20 @@ async function waitForKieTtsTask({ baseUrl, headers, taskId, timeout }) {
 
     const task = response.data?.data || response.data || {};
     const state = String(task.state || task.status || "").toLowerCase();
+    console.log("[Kie TTS] poll", { taskId, state: state || "unknown", elapsedMs: Date.now() - startedAt });
+
     if (state === "success") return task;
-    if (state === "fail" || state === "failed") {
-      throw new ApiError(502, task.failMsg || task.failure || "Kie TTS task failed.", {
+    if (state === "fail" || state === "failed" || state === "error") {
+      throw new ApiError(502, task.failMsg || task.failure || task.failReason || "Kie TTS task failed.", {
         code: "KIE_TTS_FAILED",
         provider: "kie",
         taskId,
+        state,
         providerBody: task
       });
     }
+    // In-progress states (waiting, queuing, queued, generating, processing, running, pending)
+    // and any unrecognized state fall through and keep polling until success/fail/timeout.
 
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
@@ -153,7 +168,9 @@ async function waitForKieTtsTask({ baseUrl, headers, taskId, timeout }) {
 }
 
 export async function synthesizeSpeechWithKie({ text, voice } = {}) {
-  if (!process.env.KIE_API_KEY) throw new ApiError(500, "KIE_API_KEY is missing.");
+  if (!process.env.KIE_API_KEY) {
+    throw new ApiError(500, "KIE_API_KEY is missing.", { code: "KIE_API_KEY_MISSING", provider: "kie" });
+  }
   if (!text?.trim()) throw new ApiError(400, "Text is required for speech synthesis.");
 
   const baseUrl = String(process.env.KIE_BASE_URL || DEFAULT_KIE_BASE_URL).replace(/\/+$/, "");
@@ -161,15 +178,26 @@ export async function synthesizeSpeechWithKie({ text, voice } = {}) {
   const model = String(process.env.KIE_TTS_MODEL || DEFAULT_KIE_TTS_MODEL).trim();
   const timeout = Number(process.env.KIE_TTS_TIMEOUT_MS || 45000);
   const callBackUrl = normalizeKieCallbackUrl(process.env.KIE_TTS_CALLBACK_URL || process.env.KIE_CALLBACK_URL);
+  // The API key lives only in the Authorization header, never in the payload, so logging the
+  // payload below is safe.
   const headers = {
     Authorization: `Bearer ${process.env.KIE_API_KEY}`,
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    Accept: "application/json"
   };
   const payload = {
     model,
     callBackUrl,
     input: buildKieTtsInput({ text, voice })
   };
+
+  console.log("[Kie TTS] createTask request", {
+    endpoint,
+    model,
+    voice: payload.input.voice,
+    textLength: text.length,
+    outputFormat: payload.input.output_format || "(unset — transcode downstream)"
+  });
 
   let taskResponse;
   try {
@@ -196,16 +224,27 @@ export async function synthesizeSpeechWithKie({ text, voice } = {}) {
       code: "KIE_TTS_FAILED",
       provider: "kie",
       providerStatus: taskResponse.data.code,
+      taskId: taskResponse.data?.data?.taskId || null,
+      recordId: taskResponse.data?.data?.recordId || null,
       providerBody: taskResponse.data
     });
   }
 
   const taskId = taskResponse.data?.data?.taskId || taskResponse.data?.taskId;
-  if (!taskId) throw new ApiError(502, "Kie TTS did not return a task ID.");
+  if (!taskId) {
+    throw new ApiError(502, "Kie TTS did not return a task ID.", {
+      code: "KIE_TTS_NO_TASK_ID",
+      provider: "kie",
+      providerBody: taskResponse.data
+    });
+  }
 
   const task = await waitForKieTtsTask({ baseUrl, headers, taskId, timeout });
   const audioUrl = firstAudioUrl(task);
   if (!audioUrl) {
+    // Task reported success but we couldn't locate an audio URL in any known result shape.
+    // Log the full (secret-free) task body so the actual response structure is visible.
+    console.error("[Kie TTS] success but no audio URL found in result", { taskId, task });
     throw new ApiError(502, "Kie TTS returned no audio URL.", {
       code: "KIE_TTS_NO_AUDIO",
       provider: "kie",
@@ -267,9 +306,11 @@ export async function synthesizeSpeechWithKie({ text, voice } = {}) {
     } catch (error) {
       console.error("[Kie TTS] TRANSCODE FAILED", {
         taskId,
+        ffmpeg: getFfmpegStatus(),
         contentType: contentType || "unknown",
         inputFormat: inputFormat || "auto",
         inputBytes: audioBuffer.length,
+        errorCode: error.details?.code || null,
         message: error.message,
         stack: error.stack
       });

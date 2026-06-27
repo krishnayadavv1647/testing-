@@ -22,6 +22,7 @@ import dograhIntegrationRoutes from "./routes/dograhIntegration.routes.js";
 import dograhRoutes from "./routes/dograh.routes.js";
 import emailRoutes from "./routes/email.routes.js";
 import emailIntegrationRoutes from "./routes/emailIntegration.routes.js";
+import healthRoutes from "./routes/health.routes.js";
 import followUpRoutes from "./routes/followUp.routes.js";
 import importCallsRoutes from "./routes/importCalls.routes.js";
 import knowledgeRoutes from "./routes/knowledge.routes.js";
@@ -78,6 +79,9 @@ app.get("/api/health", (req, res) => {
     uploadsPath,
   });
 });
+
+// Admin-only deep health checks (e.g. /api/health/tts)
+app.use("/api/health", healthRoutes);
 
 // Routes
 app.use("/api/auth", authRoutes);

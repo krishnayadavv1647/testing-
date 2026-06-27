@@ -12,6 +12,7 @@ import { refreshPlanConfig } from "./config/plans.js";
 import { refreshCreditPricing } from "./config/creditPricing.js";
 import { attachMediaStreamServer } from "./telephony/mediaStream.js";
 import { runElevenLabsStartupHealthCheck } from "./services/voiceProviders/elevenLabsDiagnostics.js";
+import { runTtsStartupDiagnostics } from "./voice/tts/startupDiagnostics.js";
 
 const PORT = process.env.PORT || 5000;
 
@@ -23,7 +24,11 @@ connectDB()
       console.log(`AI Voice Agent API running on port ${PORT}`);
     });
     attachMediaStreamServer(server);
-    if (process.env.CUSTOM_TTS_PROVIDER !== "kie" && process.env.KIE_TTS_ENABLED !== "true") {
+
+    // Log a secret-free TTS runtime summary and surface any misconfiguration loudly,
+    // so a broken live-call TTS path is diagnosable from logs without placing a phone call.
+    const ttsRuntime = runTtsStartupDiagnostics();
+    if (ttsRuntime.provider === "elevenlabs") {
       runElevenLabsStartupHealthCheck().catch((error) => {
         console.warn("[ElevenLabs] Startup health check failed unexpectedly", error.message);
       });
