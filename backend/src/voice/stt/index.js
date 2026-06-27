@@ -6,7 +6,9 @@ const DEEPGRAM_LIVE_URL = "wss://api.deepgram.com/v1/listen";
 
 export function createDeepgramLiveTranscriber({
   apiKey = process.env.DEEPGRAM_API_KEY,
+  onInterimTranscript,
   onFinalTranscript,
+  onClose,
   metadata = {}
 } = {}) {
   if (!apiKey) {
@@ -41,8 +43,9 @@ export function createDeepgramLiveTranscriber({
     console.log("[Deepgram] Live socket closed", {
       ...metadata,
       code,
-      reason: reason?.toString() || null
+      reason: reason?.toString?.() || reason || null
     });
+    onClose?.({ code, reason });
   });
 
   socket.on("message", (data) => {
@@ -53,14 +56,25 @@ export function createDeepgramLiveTranscriber({
       return;
     }
 
-    const transcript = result.channel?.alternatives?.[0]?.transcript?.trim();
+    const transcript = result?.channel?.alternatives?.[0]?.transcript?.trim();
+    if (!transcript) return;
 
-    if (result.is_final && transcript) {
-      console.log("[Deepgram] Final transcript", { ...metadata, transcript });
-      onFinalTranscript?.(transcript);
-    } else if (process.env.DEBUG_STT_INTERIM === "true" && transcript) {
-      console.log("[Deepgram] Interim transcript", { ...metadata, transcript });
+    const isFinal = Boolean(result?.is_final);
+    const speechFinal = Boolean(result?.speech_final);
+
+    // Treat is_final OR speech_final as a final transcript. Pure interim results
+    // (neither flag set) are surfaced separately so the caller can echo the latest
+    // interim if Deepgram closes before emitting a final.
+    if (!isFinal && !speechFinal) {
+      if (process.env.DEBUG_STT_INTERIM === "true") {
+        console.log("[Deepgram] Interim transcript", { ...metadata, transcript });
+      }
+      onInterimTranscript?.(transcript, result);
+      return;
     }
+
+    console.log("[Deepgram] Final transcript", { ...metadata, transcript, isFinal, speechFinal });
+    onFinalTranscript?.(transcript, result);
   });
 
   socket.on("error", (error) => {

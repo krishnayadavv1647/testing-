@@ -62,6 +62,118 @@ async function streamAudioBufferToTwilio(ws, session, audioBuffer) {
   }
 }
 
+// Echo the caller's words back via TTS. Shared by the final-transcript, interim-debounce,
+// and interim-on-close paths. Never calls an LLM/agent — it only repeats `rawText`.
+// `source` identifies which path triggered the echo (final | interim_debounce | interim_on_close).
+async function echoTranscript(ws, session, rawText, source = "final") {
+  const transcript = rawText?.trim();
+  if (!transcript) return;
+
+  if (process.env.CALL_DEBUG_TRANSCRIPT_ONLY === "true") {
+    console.log("[EchoBot] Transcript-only mode enabled; skipping TTS echo.", {
+      streamSid: session.streamSid,
+      callSid: session.callSid,
+      source,
+      text: transcript
+    });
+    return;
+  }
+
+  const customAiMode = (process.env.CUSTOM_AI_MODE || "echo").toLowerCase();
+  if (customAiMode !== "echo") {
+    console.log("[EchoBot] Skipped because CUSTOM_AI_MODE is not echo", {
+      customAiMode,
+      streamSid: session.streamSid
+    });
+    return;
+  }
+
+  // Dedupe: the same text can arrive as a debounced interim AND a final (or twice from
+  // Deepgram). Don't echo identical text again within 3s.
+  const now = Date.now();
+  if (
+    session.lastEchoedTranscript === transcript &&
+    now - session.lastEchoedAt < 3000
+  ) {
+    console.log("[EchoBot] Duplicate transcript skipped", {
+      streamSid: session.streamSid,
+      source,
+      text: transcript
+    });
+    return;
+  }
+
+  // Prevent overlapping echoes (e.g. the debounce timer firing while a previous echo
+  // is still streaming).
+  if (session.echoInProgress) {
+    console.log("[EchoBot] Echo already in progress; skipping overlapping echo", {
+      streamSid: session.streamSid,
+      source,
+      text: transcript
+    });
+    return;
+  }
+
+  session.echoInProgress = true;
+  session.lastEchoedTranscript = transcript;
+  session.lastEchoedAt = now;
+
+  try {
+    session.transcriptCount = (session.transcriptCount || 0) + 1;
+
+    console.log("[Caller Transcript]", {
+      streamSid: session.streamSid,
+      callSid: session.callSid,
+      agentId: session.agentId,
+      telephonyConfigId: session.telephonyConfigId,
+      transcriptCount: session.transcriptCount,
+      source,
+      text: transcript
+    });
+
+    console.log("[EchoBot] Repeating caller transcript", {
+      streamSid: session.streamSid,
+      callSid: session.callSid,
+      source,
+      provider: process.env.CUSTOM_TTS_PROVIDER || null,
+      textLength: transcript.length,
+      text: transcript
+    });
+
+    const audio = await synthesizeSpeech({ text: transcript });
+
+    console.log("[EchoBot] TTS success", {
+      streamSid: session.streamSid,
+      callSid: session.callSid,
+      bytes: audio?.length || 0
+    });
+
+    await streamAudioBufferToTwilio(ws, session, audio);
+
+    console.log("[EchoBot] Audio streamed back to caller", {
+      streamSid: session.streamSid,
+      callSid: session.callSid,
+      source
+    });
+  } catch (error) {
+    // Echo failure is non-fatal: log the real error, keep the call open, do NOT play
+    // a generic fallback and do NOT hang up the WebSocket.
+    console.error("[EchoBot] Echo TTS/audio stream failed", {
+      streamSid: session.streamSid,
+      callSid: session.callSid,
+      source,
+      provider: process.env.CUSTOM_TTS_PROVIDER || null,
+      code: error?.details?.code || error?.code,
+      message: error?.message,
+      statusCode: error?.statusCode,
+      details: error?.details,
+      stack: error?.stack
+    });
+  } finally {
+    session.echoInProgress = false;
+  }
+}
+
 function closeDeepgram(session) {
   if (!session.deepgram) return;
 
@@ -122,6 +234,10 @@ async function playTwilioTtsFallback(ws, session, reason) {
 }
 
 function cleanUpSession(session) {
+  if (session.interimEchoTimer) {
+    clearTimeout(session.interimEchoTimer);
+    session.interimEchoTimer = null;
+  }
   closeDeepgram(session);
   session.closed = true;
   session.speaking = false;
@@ -145,98 +261,68 @@ async function handleStart(ws, session, message) {
 
   try {
     session.deepgram = createDeepgramLiveTranscriber({
-      metadata: { streamSid: session.streamSid, callSid: session.callSid },
-      onFinalTranscript: async (text) => {
-        if (session.closed) return;
+      metadata: {
+        streamSid: session.streamSid,
+        callSid: session.callSid,
+        agentId: session.agentId,
+        telephonyConfigId: session.telephonyConfigId
+      },
 
-        // Only final transcripts reach here (interim transcripts are never echoed).
+      onInterimTranscript: (text) => {
         const transcript = text?.trim();
-        if (!transcript) {
-          return;
-        }
+        if (!transcript) return;
 
-        session.transcriptCount = (session.transcriptCount || 0) + 1;
+        session.latestInterimTranscript = transcript;
+        session.latestInterimAt = Date.now();
 
-        console.log("[Caller Transcript]", {
+        console.log("[EchoBot] Stored interim transcript", {
           streamSid: session.streamSid,
           callSid: session.callSid,
-          agentId: session.agentId,
-          telephonyConfigId: session.telephonyConfigId,
-          transcriptCount: session.transcriptCount,
           text: transcript
         });
-        console.log(`[MediaStream:${session.streamSid}] Transcript: ${transcript}`);
 
-        // CALL_DEBUG_TRANSCRIPT_ONLY=true: log transcripts only, skip TTS, keep call open.
-        // Use this to verify STT works independently of TTS.
-        if (process.env.CALL_DEBUG_TRANSCRIPT_ONLY === "true") {
-          console.log("[EchoBot] Transcript-only mode enabled; skipping TTS echo.", {
-            streamSid: session.streamSid,
-            callSid: session.callSid,
-            text: transcript
-          });
-          return;
+        // Debounce: if Deepgram never sends a final transcript, echo the latest interim
+        // after a short pause in speech. Each new interim resets the timer.
+        clearTimeout(session.interimEchoTimer);
+        if (process.env.ECHO_INTERIM_AFTER_MS) {
+          const delayMs = Number(process.env.ECHO_INTERIM_AFTER_MS || 1200);
+          session.interimEchoTimer = setTimeout(() => {
+            const latest = session.latestInterimTranscript;
+            if (latest) {
+              echoTranscript(ws, session, latest, "interim_debounce").catch((error) => {
+                console.error("[EchoBot] Interim debounce echo failed", {
+                  streamSid: session.streamSid,
+                  message: error?.message,
+                  stack: error?.stack
+                });
+              });
+            }
+          }, delayMs);
         }
+      },
 
-        const customAiMode = (process.env.CUSTOM_AI_MODE || "echo").toLowerCase();
+      onFinalTranscript: async (text) => {
+        // A real final arrived — cancel any pending interim-debounce echo for this utterance.
+        if (session.interimEchoTimer) {
+          clearTimeout(session.interimEchoTimer);
+          session.interimEchoTimer = null;
+        }
+        await echoTranscript(ws, session, text, "final");
+      },
 
-        if (customAiMode === "echo") {
-          // Dedupe: Deepgram can emit the same final transcript twice in quick succession.
-          // Don't echo identical text again within 3s.
-          const now = Date.now();
-          if (
-            session.lastEchoedTranscript === transcript &&
-            now - session.lastEchoedAt < 3000
-          ) {
-            console.log("[EchoBot] Duplicate transcript skipped", {
+      onClose: async () => {
+        // Deepgram closed (e.g. code 1005) before emitting a final transcript. As a last
+        // resort, echo the latest interim so the caller still hears their words repeated.
+        if (process.env.ECHO_INTERIM_ON_CLOSE === "true") {
+          const latest = session.latestInterimTranscript;
+          if (latest) {
+            console.log("[EchoBot] Deepgram closed before final transcript. Echoing latest interim transcript.", {
               streamSid: session.streamSid,
-              text: transcript
+              callSid: session.callSid,
+              text: latest
             });
-            return;
+            await echoTranscript(ws, session, latest, "interim_on_close");
           }
-          session.lastEchoedTranscript = transcript;
-          session.lastEchoedAt = now;
-
-          try {
-            // Echo mode: repeat the caller's exact words back. No OpenAI / agent runtime.
-            console.log("[EchoBot] Repeating caller transcript", {
-              streamSid: session.streamSid,
-              callSid: session.callSid,
-              provider: process.env.CUSTOM_TTS_PROVIDER || null,
-              textLength: transcript.length,
-              text: transcript
-            });
-
-            const audio = await synthesizeSpeech({ text: transcript });
-
-            console.log("[EchoBot] TTS success", {
-              streamSid: session.streamSid,
-              callSid: session.callSid,
-              bytes: audio?.length || 0
-            });
-
-            await streamAudioBufferToTwilio(ws, session, audio);
-
-            console.log("[EchoBot] Audio streamed back to caller", {
-              streamSid: session.streamSid,
-              callSid: session.callSid
-            });
-          } catch (error) {
-            // Echo failure is non-fatal: log the real error, keep the call open, do NOT play
-            // the generic fallback and do NOT hang up the WebSocket.
-            console.error("[EchoBot] Echo TTS failed", {
-              streamSid: session.streamSid,
-              callSid: session.callSid,
-              provider: process.env.CUSTOM_TTS_PROVIDER || null,
-              code: error?.details?.code || error?.code,
-              message: error?.message,
-              statusCode: error?.statusCode,
-              details: error?.details,
-              stack: error?.stack
-            });
-          }
-
-          return;
         }
       }
     });
@@ -338,8 +424,12 @@ export function attachMediaStreamServer(httpServer) {
       closed: false,
       mediaFrameCount: 0,
       transcriptCount: 0,
+      latestInterimTranscript: null,
+      latestInterimAt: 0,
       lastEchoedTranscript: null,
-      lastEchoedAt: 0
+      lastEchoedAt: 0,
+      echoInProgress: false,
+      interimEchoTimer: null
     };
 
     ws.on("message", (message) => handleMessage(ws, session, message));
