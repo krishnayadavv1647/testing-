@@ -115,8 +115,9 @@ function buildKieTtsInput({ text, voice }) {
 }
 
 async function waitForKieTtsTask({ baseUrl, headers, taskId, timeout }) {
-  const pollMs = Math.max(1000, Number(process.env.KIE_TTS_POLL_INTERVAL_MS || 1500));
+  const pollMs = Math.max(100, Number(process.env.KIE_TTS_POLL_INTERVAL_MS || 750));
   const startedAt = Date.now();
+  let lastState = "unknown";
 
   while (Date.now() - startedAt < timeout) {
     let response;
@@ -142,9 +143,17 @@ async function waitForKieTtsTask({ baseUrl, headers, taskId, timeout }) {
 
     const task = response.data?.data || response.data || {};
     const state = String(task.state || task.status || "").toLowerCase();
-    console.log("[Kie TTS] poll", { taskId, state: state || "unknown", elapsedMs: Date.now() - startedAt });
+    lastState = state || "unknown";
+    console.log("[Kie TTS] poll", { taskId, state: lastState, elapsedMs: Date.now() - startedAt });
 
-    if (state === "success") return task;
+    if (state === "success") {
+      console.log("[Kie TTS] success", {
+        taskId,
+        audioUrlFound: Boolean(firstAudioUrl(task)),
+        elapsedMs: Date.now() - startedAt
+      });
+      return task;
+    }
     if (state === "fail" || state === "failed" || state === "error") {
       throw new ApiError(502, task.failMsg || task.failure || task.failReason || "Kie TTS task failed.", {
         code: "KIE_TTS_FAILED",
@@ -160,10 +169,14 @@ async function waitForKieTtsTask({ baseUrl, headers, taskId, timeout }) {
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
 
-  throw new ApiError(504, "Kie TTS timed out.", {
+  const elapsedMs = Date.now() - startedAt;
+  throw new ApiError(504, "Kie TTS task did not complete before timeout.", {
     code: "KIE_TTS_TIMEOUT",
     provider: "kie",
-    taskId
+    taskId,
+    lastState,
+    elapsedMs,
+    timeoutMs: timeout
   });
 }
 
@@ -176,7 +189,7 @@ export async function synthesizeSpeechWithKie({ text, voice } = {}) {
   const baseUrl = String(process.env.KIE_BASE_URL || DEFAULT_KIE_BASE_URL).replace(/\/+$/, "");
   const endpoint = joinUrl(baseUrl, process.env.KIE_CREATE_TASK_ENDPOINT || DEFAULT_KIE_CREATE_TASK_ENDPOINT);
   const model = String(process.env.KIE_TTS_MODEL || DEFAULT_KIE_TTS_MODEL).trim();
-  const timeout = Number(process.env.KIE_TTS_TIMEOUT_MS || 45000);
+  const timeout = Number(process.env.KIE_TTS_TIMEOUT_MS || 15000);
   const callBackUrl = normalizeKieCallbackUrl(process.env.KIE_TTS_CALLBACK_URL || process.env.KIE_CALLBACK_URL);
   // The API key lives only in the Authorization header, never in the payload, so logging the
   // payload below is safe.

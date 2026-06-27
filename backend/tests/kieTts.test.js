@@ -83,6 +83,30 @@ test("task success with no audio URL throws KIE_TTS_NO_AUDIO", async (t) => {
   );
 });
 
+test("waiting task past timeout throws KIE_TTS_TIMEOUT with last state details", async (t) => {
+  setKieEnv();
+  process.env.KIE_TTS_TIMEOUT_MS = "1";
+  process.env.KIE_TTS_POLL_INTERVAL_MS = "100";
+  t.mock.method(axios, "post", async () => ({ data: { code: 200, data: { taskId: "T_TIMEOUT" } } }));
+  t.mock.method(axios, "get", async (url) => {
+    assert.match(String(url), /recordInfo/);
+    return { data: { code: 200, data: { taskId: "T_TIMEOUT", state: "waiting" } } };
+  });
+
+  await assert.rejects(
+    () => synthesizeSpeechWithKie({ text: "hello" }),
+    (error) => {
+      assert.equal(error.details?.code, "KIE_TTS_TIMEOUT");
+      assert.equal(error.message, "Kie TTS task did not complete before timeout.");
+      assert.equal(error.details?.taskId, "T_TIMEOUT");
+      assert.equal(error.details?.lastState, "waiting");
+      assert.equal(error.details?.timeoutMs, 1);
+      assert.ok(error.details?.elapsedMs >= 1);
+      return true;
+    }
+  );
+});
+
 test("audio/basic (raw mulaw) content skips transcode and returns the raw buffer", async (t) => {
   setKieEnv();
   const raw = Buffer.from([0xff, 0xfe, 0x7f, 0x00, 0x80, 0x12]);

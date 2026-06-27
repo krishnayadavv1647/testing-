@@ -83,7 +83,20 @@ async function echoTranscript(ws, session, rawText, source = "final") {
   if (customAiMode !== "echo") {
     console.log("[EchoBot] Skipped because CUSTOM_AI_MODE is not echo", {
       customAiMode,
-      streamSid: session.streamSid
+      streamSid: session.streamSid,
+      source,
+      text: transcript
+    });
+    return;
+  }
+
+  if (!session.twilioWsOpen || ws.readyState !== WebSocket.OPEN) {
+    console.warn("[EchoBot] Cannot echo because Twilio WebSocket is not open", {
+      streamSid: session.streamSid,
+      callSid: session.callSid,
+      readyState: ws.readyState,
+      source,
+      text: transcript
     });
     return;
   }
@@ -140,20 +153,34 @@ async function echoTranscript(ws, session, rawText, source = "final") {
       text: transcript
     });
 
+    const ttsStartedAt = Date.now();
     const audio = await synthesizeSpeech({ text: transcript });
 
     console.log("[EchoBot] TTS success", {
       streamSid: session.streamSid,
       callSid: session.callSid,
-      bytes: audio?.length || 0
+      provider: process.env.CUSTOM_TTS_PROVIDER || null,
+      bytes: audio?.length || 0,
+      elapsedMs: Date.now() - ttsStartedAt
     });
+
+    if (!session.twilioWsOpen || ws.readyState !== WebSocket.OPEN) {
+      console.warn("[EchoBot] TTS completed but Twilio WebSocket is already closed", {
+        streamSid: session.streamSid,
+        callSid: session.callSid,
+        readyState: ws.readyState,
+        elapsedMs: Date.now() - ttsStartedAt
+      });
+      return;
+    }
 
     await streamAudioBufferToTwilio(ws, session, audio);
 
     console.log("[EchoBot] Audio streamed back to caller", {
       streamSid: session.streamSid,
       callSid: session.callSid,
-      source
+      source,
+      bytes: audio?.length || 0
     });
   } catch (error) {
     // Echo failure is non-fatal: log the real error, keep the call open, do NOT play
@@ -283,22 +310,25 @@ async function handleStart(ws, session, message) {
 
         // Debounce: if Deepgram never sends a final transcript, echo the latest interim
         // after a short pause in speech. Each new interim resets the timer.
-        clearTimeout(session.interimEchoTimer);
-        if (process.env.ECHO_INTERIM_AFTER_MS) {
-          const delayMs = Number(process.env.ECHO_INTERIM_AFTER_MS || 1200);
-          session.interimEchoTimer = setTimeout(() => {
-            const latest = session.latestInterimTranscript;
-            if (latest) {
-              echoTranscript(ws, session, latest, "interim_debounce").catch((error) => {
-                console.error("[EchoBot] Interim debounce echo failed", {
-                  streamSid: session.streamSid,
-                  message: error?.message,
-                  stack: error?.stack
-                });
-              });
-            }
-          }, delayMs);
+        if (session.interimEchoTimer) {
+          clearTimeout(session.interimEchoTimer);
         }
+
+        const delayMs = Number(process.env.ECHO_INTERIM_AFTER_MS || 1000);
+        session.interimEchoTimer = setTimeout(() => {
+          const latest = session.latestInterimTranscript?.trim();
+          if (!latest) return;
+
+          echoTranscript(ws, session, latest, "interim_debounce").catch((error) => {
+            console.error("[EchoBot] Interim debounce echo failed", {
+              streamSid: session.streamSid,
+              callSid: session.callSid,
+              message: error?.message,
+              code: error?.code,
+              stack: error?.stack
+            });
+          });
+        }, delayMs);
       },
 
       onFinalTranscript: async (text) => {
@@ -323,6 +353,12 @@ async function handleStart(ws, session, message) {
             });
             await echoTranscript(ws, session, latest, "interim_on_close");
           }
+        } else {
+          console.log("[EchoBot] Deepgram closed; not echoing on close because ECHO_INTERIM_ON_CLOSE is false", {
+            streamSid: session.streamSid,
+            callSid: session.callSid,
+            latestInterimTranscript: session.latestInterimTranscript || null
+          });
         }
       }
     });
@@ -426,15 +462,17 @@ export function attachMediaStreamServer(httpServer) {
       transcriptCount: 0,
       latestInterimTranscript: null,
       latestInterimAt: 0,
+      interimEchoTimer: null,
       lastEchoedTranscript: null,
       lastEchoedAt: 0,
       echoInProgress: false,
-      interimEchoTimer: null
+      twilioWsOpen: true
     };
 
     ws.on("message", (message) => handleMessage(ws, session, message));
 
     ws.on("close", (code, reason) => {
+      session.twilioWsOpen = false;
       console.log(`[MediaStream:${session.streamSid || "unknown"}] WebSocket closed`, {
         code,
         reason: reason?.toString() || null,
@@ -446,6 +484,7 @@ export function attachMediaStreamServer(httpServer) {
     });
 
     ws.on("error", (error) => {
+      session.twilioWsOpen = false;
       console.error(`[MediaStream:${session.streamSid || "unknown"}] WebSocket error`, {
         message: error?.message,
         stack: error?.stack
