@@ -136,9 +136,18 @@ function handleStart(ws, session, message) {
           await streamAudioBufferToTwilio(ws, session, audio);
         } catch (error) {
           console.error(`[MediaStream:${session.streamSid}] TTS echo failed`, {
-            message: error.message,
-            statusCode: error.statusCode,
-            details: error.details
+            code: error?.code,
+            message: error?.message,
+            statusCode: error?.statusCode,
+            details: error?.details,
+            stack: error?.stack
+          });
+          console.error("[Technical Issue Fallback Triggered]", {
+            code: error?.code,
+            message: error?.message,
+            statusCode: error?.statusCode,
+            details: error?.details,
+            stack: error?.stack
           });
           await playTwilioTtsFallback(ws, session, error.details?.category || error.message);
         }

@@ -1,6 +1,7 @@
 import axios from "axios";
 
 import { ApiError } from "../../utils/apiError.js";
+import { inputFormatFromContentType, transcodeToMulaw8k } from "./audioTranscode.js";
 
 const DEFAULT_KIE_BASE_URL = "https://api.kie.ai";
 const DEFAULT_KIE_CREATE_TASK_ENDPOINT = "/api/v1/jobs/createTask";
@@ -224,23 +225,72 @@ export async function synthesizeSpeechWithKie({ text, voice } = {}) {
   }
 
   const contentType = String(audioResponse.headers["content-type"] || "").toLowerCase();
-  if (process.env.KIE_TTS_REQUIRE_MULAW !== "false" && /(audio\/mpeg|audio\/mp3|audio\/wav|audio\/wave|audio\/x-wav)/i.test(contentType)) {
-    throw new ApiError(502, `Kie TTS returned ${contentType}, but Twilio media streams require raw ulaw_8000 audio.`, {
-      code: "KIE_TTS_UNSUPPORTED_AUDIO_FORMAT",
-      provider: "kie",
+  const audioBuffer = Buffer.from(audioResponse.data);
+  console.log("[Kie TTS] response received", {
+    taskId,
+    contentType: contentType || "unknown",
+    bytes: audioBuffer.length
+  });
+
+  if (process.env.KIE_TTS_REQUIRE_MULAW !== "false") {
+    const inputFormat = inputFormatFromContentType(contentType);
+
+    // When Kie was asked for ulaw_8000 output (KIE_TTS_OUTPUT_FORMAT=ulaw_8000) it returns
+    // raw μ-law audio, typically with content-type audio/basic. That is exactly what Twilio
+    // expects — transcoding is unnecessary and would fail because raw μ-law has no file header
+    // for ffmpeg to auto-detect. Short-circuit here when we can confirm the audio is already
+    // in the correct format.
+    if (inputFormat === "mulaw") {
+      console.log("[Kie TTS] audio is already μ-law 8kHz, skipping transcode", {
+        taskId,
+        contentType: contentType || "unknown",
+        bytes: audioBuffer.length
+      });
+      return audioBuffer;
+    }
+
+    console.log("[Kie TTS] starting transcode to ulaw_8000", {
       taskId,
-      contentType,
-      expectedFormat: "ulaw_8000"
+      contentType: contentType || "unknown",
+      inputFormat: inputFormat || "auto (unknown content-type)",
+      inputBytes: audioBuffer.length
     });
+
+    try {
+      const transcoded = await transcodeToMulaw8k(audioBuffer, { contentType, inputFormat });
+      console.log("[Kie TTS] transcode complete", {
+        taskId,
+        outputFormat: "ulaw_8000",
+        outputBytes: transcoded.length
+      });
+      return transcoded;
+    } catch (error) {
+      console.error("[Kie TTS] TRANSCODE FAILED", {
+        taskId,
+        contentType: contentType || "unknown",
+        inputFormat: inputFormat || "auto",
+        inputBytes: audioBuffer.length,
+        message: error.message,
+        stack: error.stack
+      });
+      throw new ApiError(502, `Kie TTS audio transcoding failed: ${error.message}`, {
+        code: "KIE_TTS_TRANSCODE_FAILED",
+        provider: "kie",
+        taskId,
+        contentType,
+        inputFormat,
+        expectedFormat: "ulaw_8000"
+      });
+    }
   }
 
-  console.log("[Kie TTS Success]", {
+  console.log("[Kie TTS] success (transcode skipped via KIE_TTS_REQUIRE_MULAW=false)", {
     taskId,
     model,
     voice: payload.input.voice,
     contentType: contentType || "unknown",
-    bytes: audioResponse.data?.byteLength || audioResponse.data?.length || 0
+    bytes: audioBuffer.length
   });
 
-  return Buffer.from(audioResponse.data);
+  return audioBuffer;
 }
