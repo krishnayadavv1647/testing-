@@ -149,6 +149,12 @@ async function handleStart(ws, session, message) {
       onFinalTranscript: async (text) => {
         if (session.closed) return;
 
+        // Only final transcripts reach here (interim transcripts are never echoed).
+        const transcript = text?.trim();
+        if (!transcript) {
+          return;
+        }
+
         session.transcriptCount = (session.transcriptCount || 0) + 1;
 
         console.log("[Caller Transcript]", {
@@ -157,57 +163,80 @@ async function handleStart(ws, session, message) {
           agentId: session.agentId,
           telephonyConfigId: session.telephonyConfigId,
           transcriptCount: session.transcriptCount,
-          text
+          text: transcript
         });
-        console.log(`[MediaStream:${session.streamSid}] Transcript: ${text}`);
+        console.log(`[MediaStream:${session.streamSid}] Transcript: ${transcript}`);
 
-        // CALL_DEBUG_TRANSCRIPT_ONLY=true: log transcripts, skip TTS, keep call open.
+        // CALL_DEBUG_TRANSCRIPT_ONLY=true: log transcripts only, skip TTS, keep call open.
         // Use this to verify STT works independently of TTS.
         if (process.env.CALL_DEBUG_TRANSCRIPT_ONLY === "true") {
-          console.log("[Call Debug] Transcript-only mode; skipping TTS response.", {
+          console.log("[EchoBot] Transcript-only mode enabled; skipping TTS echo.", {
             streamSid: session.streamSid,
-            text
+            callSid: session.callSid,
+            text: transcript
           });
           return;
         }
 
-        try {
-          // NOTE: Echo/demo mode — synthesizes the caller's own transcript back to speech.
-          // Does NOT run the agent LLM.
-          // TODO(custom_ai): route `text` through runCustomAgent and synthesize the agent's
-          // reply instead, so the live call becomes a real conversation.
-          const provider = getTtsRuntimeSummary().provider;
-          console.log(`[MediaStream:${session.streamSid}] TTS requested`, {
-            provider,
-            textLength: text.length
-          });
+        const customAiMode = (process.env.CUSTOM_AI_MODE || "echo").toLowerCase();
 
-          const audio = await synthesizeSpeech({ text });
+        if (customAiMode === "echo") {
+          // Dedupe: Deepgram can emit the same final transcript twice in quick succession.
+          // Don't echo identical text again within 3s.
+          const now = Date.now();
+          if (
+            session.lastEchoedTranscript === transcript &&
+            now - session.lastEchoedAt < 3000
+          ) {
+            console.log("[EchoBot] Duplicate transcript skipped", {
+              streamSid: session.streamSid,
+              text: transcript
+            });
+            return;
+          }
+          session.lastEchoedTranscript = transcript;
+          session.lastEchoedAt = now;
 
-          console.log(`[MediaStream:${session.streamSid}] TTS success`, {
-            provider,
-            bytes: audio?.length || 0
-          });
+          try {
+            // Echo mode: repeat the caller's exact words back. No OpenAI / agent runtime.
+            console.log("[EchoBot] Repeating caller transcript", {
+              streamSid: session.streamSid,
+              callSid: session.callSid,
+              provider: process.env.CUSTOM_TTS_PROVIDER || null,
+              textLength: transcript.length,
+              text: transcript
+            });
 
-          await streamAudioBufferToTwilio(ws, session, audio);
-        } catch (error) {
-          const provider = getTtsRuntimeSummary().provider;
-          const fallbackReason = error?.details?.code || error?.details?.category || error?.message;
-          console.error("[Technical Issue Fallback Triggered]", {
-            provider,
-            streamSid: session.streamSid || null,
-            callSid: session.callSid || null,
-            telephonyConfigId: session.telephonyConfigId || null,
-            agentId: session.agentId || null,
-            code: error?.details?.code || error?.code || null,
-            message: error?.message,
-            statusCode: error?.statusCode || error?.details?.providerStatus || null,
-            details: error?.details,
-            providerBody: safeProviderBody(error?.details?.providerBody),
-            fallbackReason,
-            stack: error?.stack
-          });
-          await playTwilioTtsFallback(ws, session, fallbackReason);
+            const audio = await synthesizeSpeech({ text: transcript });
+
+            console.log("[EchoBot] TTS success", {
+              streamSid: session.streamSid,
+              callSid: session.callSid,
+              bytes: audio?.length || 0
+            });
+
+            await streamAudioBufferToTwilio(ws, session, audio);
+
+            console.log("[EchoBot] Audio streamed back to caller", {
+              streamSid: session.streamSid,
+              callSid: session.callSid
+            });
+          } catch (error) {
+            // Echo failure is non-fatal: log the real error, keep the call open, do NOT play
+            // the generic fallback and do NOT hang up the WebSocket.
+            console.error("[EchoBot] Echo TTS failed", {
+              streamSid: session.streamSid,
+              callSid: session.callSid,
+              provider: process.env.CUSTOM_TTS_PROVIDER || null,
+              code: error?.details?.code || error?.code,
+              message: error?.message,
+              statusCode: error?.statusCode,
+              details: error?.details,
+              stack: error?.stack
+            });
+          }
+
+          return;
         }
       }
     });
@@ -308,7 +337,9 @@ export function attachMediaStreamServer(httpServer) {
       fallbackTriggered: false,
       closed: false,
       mediaFrameCount: 0,
-      transcriptCount: 0
+      transcriptCount: 0,
+      lastEchoedTranscript: null,
+      lastEchoedAt: 0
     };
 
     ws.on("message", (message) => handleMessage(ws, session, message));
