@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import axios from "axios";
 import ffmpegPath from "ffmpeg-static";
 
-import { synthesizeSpeechWithKie } from "../src/voice/tts/kie.js";
+import { recordKieTtsCallback, synthesizeSpeechWithKie } from "../src/voice/tts/kie.js";
 import { getFfmpegStatus } from "../src/voice/tts/audioTranscode.js";
 
 const VALID_CALLBACK = "https://example.com/api/kie/callback";
@@ -145,6 +145,30 @@ test("audio/basic (raw mulaw) content skips transcode and returns the raw buffer
   const out = await synthesizeSpeechWithKie({ text: "hello" });
   assert.ok(Buffer.isBuffer(out));
   assert.deepEqual(out, raw); // identical bytes => transcode was skipped
+});
+
+test("callback success result is used before recordInfo polling", async (t) => {
+  setKieEnv();
+  const raw = Buffer.from([0xff, 0xfe, 0x7f, 0x00, 0x80, 0x12]);
+
+  recordKieTtsCallback({
+    code: 200,
+    data: {
+      taskId: "T_CALLBACK",
+      recordId: "R_CALLBACK",
+      state: "success",
+      resultJson: JSON.stringify({ resultUrls: ["https://cdn.example.com/callback.ulaw"] })
+    }
+  });
+
+  t.mock.method(axios, "post", async () => ({ data: { code: 200, data: { taskId: "T_CALLBACK", recordId: "R_CALLBACK" } } }));
+  t.mock.method(axios, "get", async (url) => {
+    assert.doesNotMatch(String(url), /recordInfo/);
+    return { data: raw, headers: { "content-type": "audio/basic" }, status: 200, statusText: "OK" };
+  });
+
+  const out = await synthesizeSpeechWithKie({ text: "hello" });
+  assert.deepEqual(out, raw);
 });
 
 test("audio/mpeg (MP3) content triggers transcode to ulaw_8000", { skip: getFfmpegStatus().executable ? false : "ffmpeg not executable" }, async (t) => {

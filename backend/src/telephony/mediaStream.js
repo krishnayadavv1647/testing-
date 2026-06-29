@@ -179,7 +179,7 @@ async function echoTranscript(ws, session, rawText, source = "final") {
   }
 
   if (session.echoInProgress) {
-    console.log("[EchoBot] Echo already in progress; skipping new Kie task", {
+    console.log("[EchoBot] Echo already in progress; skipping duplicate/new transcript", {
       streamSid: session.streamSid,
       callSid: session.callSid,
       text: transcript
@@ -395,7 +395,7 @@ async function handleStart(ws, session, message) {
           clearTimeout(session.interimEchoTimer);
         }
 
-        const delayMs = Number(process.env.ECHO_INTERIM_AFTER_MS || 1500);
+        const delayMs = Number(process.env.ECHO_INTERIM_AFTER_MS || 700);
         session.interimEchoTimer = setTimeout(() => {
           const latest = session.latestInterimTranscript?.trim();
           if (!latest) return;

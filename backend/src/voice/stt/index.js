@@ -16,11 +16,16 @@ export function createDeepgramLiveTranscriber({
   }
 
   const params = new URLSearchParams({
+    model: process.env.DEEPGRAM_MODEL || "nova-2-phonecall",
     encoding: "mulaw",
     sample_rate: "8000",
+    channels: "1",
     interim_results: "true",
-    endpointing: "300",
-    smart_format: "true"
+    smart_format: "true",
+    punctuate: "true",
+    endpointing: String(Number(process.env.DEEPGRAM_ENDPOINTING_MS || 200)),
+    utterance_end_ms: String(Number(process.env.DEEPGRAM_UTTERANCE_END_MS || 700)),
+    vad_events: "true"
   });
 
   console.log("[Deepgram] Live socket opening", metadata);

@@ -41,6 +41,7 @@ import webhookRoutes from "./routes/webhook.routes.js";
 
 import { dograhWebhook } from "./controllers/webhook.controller.js";
 import { handleBillingWebhook } from "./controllers/billing.controller.js";
+import { recordKieTtsCallback } from "./voice/tts/kie.js";
 import { errorHandler, notFound } from "./middleware/error.middleware.js";
 
 const app = express();
@@ -87,6 +88,11 @@ app.use("/api/health", healthRoutes);
 // Public runtime info — no secrets; confirms which deployed instance is running.
 // GET /api/debug/runtime -> { service, gitCommit, ttsProvider, hasKieApiKey, ... }
 app.get("/api/debug/runtime", runtimeDebug);
+
+app.post("/api/kie/callback", (req, res) => {
+  const result = recordKieTtsCallback(req.body || {});
+  res.status(200).json({ success: true, ...result });
+});
 
 // Routes
 app.use("/api/auth", authRoutes);

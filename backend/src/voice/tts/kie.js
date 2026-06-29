@@ -8,6 +8,8 @@ const DEFAULT_KIE_CREATE_TASK_ENDPOINT = "/api/v1/jobs/createTask";
 const DEFAULT_KIE_RECORD_INFO_ENDPOINT = "/api/v1/jobs/recordInfo";
 const DEFAULT_KIE_TTS_MODEL = "elevenlabs/text-to-speech-multilingual-v2";
 const DEFAULT_KIE_TTS_VOICE = "Rachel";
+const kieCallbackResults = new Map();
+const KIE_CALLBACK_TTL_MS = 10 * 60 * 1000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -45,6 +47,15 @@ function sanitizeProviderBody(value, depth = 0) {
   }
   if (typeof value === "string" && value.length > 2000) return `${value.slice(0, 2000)}...[truncated]`;
   return value;
+}
+
+function cleanupKieCallbacks() {
+  const now = Date.now();
+  for (const [key, entry] of kieCallbackResults.entries()) {
+    if (now - entry.receivedAt > KIE_CALLBACK_TTL_MS) {
+      kieCallbackResults.delete(key);
+    }
+  }
 }
 
 function providerMessage(data) {
@@ -143,6 +154,56 @@ function parseKieResultJson({ taskId, recordId, data }) {
   }
 
   return resultJson;
+}
+
+function normalizeKieTaskData(body) {
+  const data = body?.data || body || {};
+  const state = String(data?.state || data?.status || body?.state || body?.status || "").toLowerCase() || "unknown";
+  return { data, state };
+}
+
+function callbackKeys({ taskId, recordId }) {
+  return [taskId, recordId].filter(Boolean);
+}
+
+function storeCallbackForKey(key, body, data, state) {
+  kieCallbackResults.set(key, {
+    body,
+    data,
+    state,
+    receivedAt: Date.now()
+  });
+}
+
+function getCallbackResult({ taskId, recordId }) {
+  cleanupKieCallbacks();
+  for (const key of callbackKeys({ taskId, recordId })) {
+    const result = kieCallbackResults.get(key);
+    if (result) return result;
+  }
+  return null;
+}
+
+export function recordKieTtsCallback(body = {}) {
+  const { data, state } = normalizeKieTaskData(body);
+  const taskId = data?.taskId || body?.taskId || null;
+  const recordId = data?.recordId || body?.recordId || null;
+  const safeBody = sanitizeProviderBody(body);
+
+  console.log("[Kie Callback] received", {
+    taskId,
+    recordId,
+    state,
+    code: body?.code,
+    msg: body?.msg,
+    dataKeys: data ? Object.keys(data) : []
+  });
+
+  for (const key of callbackKeys({ taskId, recordId })) {
+    storeCallbackForKey(key, safeBody, data, state);
+  }
+
+  return { taskId, recordId, state };
 }
 
 function safeResultPreview(value) {
@@ -250,7 +311,7 @@ async function pollKieTask({ baseUrl, headers, taskId, recordId, timeoutMs }) {
     endpoint: recordInfoEndpoint
   });
 
-  const pollMs = Math.max(100, Number(process.env.KIE_TTS_POLL_INTERVAL_MS || 3000));
+  const pollMs = Math.max(100, Number(process.env.KIE_TTS_POLL_INTERVAL_MS || 500));
   const startedAt = Date.now();
   let lastState = null;
   let lastFailCode = null;
@@ -259,6 +320,39 @@ async function pollKieTask({ baseUrl, headers, taskId, recordId, timeoutMs }) {
   let lastProviderBodySafe = null;
 
   while (Date.now() - startedAt < timeoutMs) {
+    const callbackResult = getCallbackResult({ taskId, recordId });
+    if (callbackResult) {
+      const elapsedMs = Date.now() - startedAt;
+      console.log("[Kie TTS] using callback result", {
+        taskId,
+        recordId,
+        state: callbackResult.state,
+        elapsedMs
+      });
+
+      if (callbackResult.state === "success") {
+        return {
+          body: callbackResult.body,
+          data: callbackResult.data,
+          finalState: callbackResult.state,
+          elapsedMs
+        };
+      }
+
+      if (callbackResult.state === "fail" || callbackResult.state === "failed" || callbackResult.state === "error") {
+        throw makeApiError(502, callbackResult.data?.failMsg || "Kie TTS failed.", {
+          code: "KIE_TTS_FAILED",
+          provider: "kie",
+          taskId,
+          recordId,
+          failCode: callbackResult.data?.failCode || null,
+          failMsg: callbackResult.data?.failMsg || null,
+          state: callbackResult.state,
+          providerBodySafe: callbackResult.body
+        });
+      }
+    }
+
     let response;
     try {
       response = await axios.get(recordInfoUrl, { headers, timeout: Math.min(timeoutMs, 30000) });
@@ -268,8 +362,7 @@ async function pollKieTask({ baseUrl, headers, taskId, recordId, timeoutMs }) {
 
     const body = response.data;
     const safeBody = sanitizeProviderBody(body);
-    const data = body?.data || {};
-    const state = String(data?.state || data?.status || "").toLowerCase() || "unknown";
+    const { data, state } = normalizeKieTaskData(body);
     const elapsedMs = Date.now() - startedAt;
 
     lastState = state;
@@ -281,15 +374,8 @@ async function pollKieTask({ baseUrl, headers, taskId, recordId, timeoutMs }) {
     console.log("[Kie TTS] poll", {
       taskId,
       recordId,
-      code: body?.code,
-      msg: body?.msg,
       state,
-      failCode: data?.failCode || null,
-      failMsg: data?.failMsg || null,
-      progress: data?.progress || null,
-      costTime: data?.costTime || null,
-      elapsedMs,
-      dataKeys: data ? Object.keys(data) : []
+      elapsedMs
     });
 
     if (state === "success") {
@@ -411,7 +497,7 @@ export async function synthesizeSpeechWithKie({ text, voice } = {}) {
   const cleanText = text.trim();
   const baseUrl = String(process.env.KIE_BASE_URL || DEFAULT_KIE_BASE_URL).replace(/\/+$/, "");
   const endpoint = joinUrl(baseUrl, process.env.KIE_CREATE_TASK_ENDPOINT || DEFAULT_KIE_CREATE_TASK_ENDPOINT);
-  const timeoutMs = Number(process.env.KIE_TTS_TIMEOUT_MS || 60000);
+  const timeoutMs = Number(process.env.KIE_TTS_TIMEOUT_MS || 20000);
   const callBackUrl = normalizeKieCallbackUrl(process.env.KIE_CALLBACK_URL || process.env.KIE_TTS_CALLBACK_URL);
   const headers = {
     Authorization: `Bearer ${process.env.KIE_API_KEY}`,
