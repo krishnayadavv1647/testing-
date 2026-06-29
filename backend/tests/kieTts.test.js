@@ -70,7 +70,32 @@ test("createTask returning no taskId throws KIE_TTS_NO_TASK_ID", async (t) => {
   );
 });
 
-test("task success with no audio URL throws KIE_TTS_NO_AUDIO", async (t) => {
+test("createTask payload does not include output_format unless explicitly configured", async (t) => {
+  setKieEnv();
+  const post = t.mock.method(axios, "post", async () => ({ data: { code: 200, msg: "success", data: {} } }));
+  await assert.rejects(
+    () => synthesizeSpeechWithKie({ text: "hello" }),
+    (error) => error.details?.code === "KIE_TTS_NO_TASK_ID"
+  );
+
+  const payload = post.mock.calls[0].arguments[1];
+  assert.equal(Object.hasOwn(payload.input, "output_format"), false);
+});
+
+test("createTask payload includes output_format when explicitly configured", async (t) => {
+  setKieEnv();
+  process.env.KIE_TTS_OUTPUT_FORMAT = "mp3_44100_128";
+  const post = t.mock.method(axios, "post", async () => ({ data: { code: 200, msg: "success", data: {} } }));
+  await assert.rejects(
+    () => synthesizeSpeechWithKie({ text: "hello" }),
+    (error) => error.details?.code === "KIE_TTS_NO_TASK_ID"
+  );
+
+  const payload = post.mock.calls[0].arguments[1];
+  assert.equal(payload.input.output_format, "mp3_44100_128");
+});
+
+test("task success with no audio URL throws KIE_TTS_NO_AUDIO_URL", async (t) => {
   setKieEnv();
   t.mock.method(axios, "post", async () => ({ data: { code: 200, data: { taskId: "T1" } } }));
   t.mock.method(axios, "get", async (url) => {
@@ -79,7 +104,7 @@ test("task success with no audio URL throws KIE_TTS_NO_AUDIO", async (t) => {
   });
   await assert.rejects(
     () => synthesizeSpeechWithKie({ text: "hello" }),
-    (error) => error.details?.code === "KIE_TTS_NO_AUDIO"
+    (error) => error.details?.code === "KIE_TTS_NO_AUDIO_URL"
   );
 });
 

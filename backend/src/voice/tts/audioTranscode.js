@@ -70,6 +70,25 @@ export function inputFormatFromContentType(contentType = "") {
 
 export function transcodeToMulaw8k(inputBuffer, { contentType = "", inputFormat } = {}) {
   return new Promise((resolve, reject) => {
+    const inputContentType = String(contentType || "").toLowerCase();
+    const resolvedInputFormat = inputFormat || inputFormatFromContentType(inputContentType);
+
+    if (resolvedInputFormat === "mulaw") {
+      console.log("[audioTranscode] input already Twilio-ready; skipping transcode", {
+        inputBytes: inputBuffer.length,
+        inputContentType: inputContentType || null,
+        target: "mulaw_8000"
+      });
+      resolve(inputBuffer);
+      return;
+    }
+
+    console.log("[audioTranscode] transcode requested", {
+      inputBytes: inputBuffer.length,
+      inputContentType: inputContentType || null,
+      target: "mulaw_8000"
+    });
+
     try {
       assertFfmpegAvailable();
     } catch (error) {
@@ -79,7 +98,7 @@ export function transcodeToMulaw8k(inputBuffer, { contentType = "", inputFormat 
 
     const chunks = [];
     const input = new PassThrough();
-    const resolvedInputFormat = inputFormat || inputFormatFromContentType(contentType);
+    let stderr = "";
 
     input.end(inputBuffer);
 
@@ -91,8 +110,35 @@ export function transcodeToMulaw8k(inputBuffer, { contentType = "", inputFormat 
       .audioChannels(1)
       .audioFrequency(8000)
       .format("mulaw")
-      .on("error", reject)
-      .on("end", () => resolve(Buffer.concat(chunks)))
+      .on("stderr", (line) => {
+        stderr += `${line}\n`;
+      })
+      .on("error", (error) => {
+        console.error("[audioTranscode] transcode failed", {
+          inputBytes: inputBuffer.length,
+          inputContentType: inputContentType || null,
+          ffmpegPath,
+          message: error.message,
+          stderr
+        });
+
+        const wrapped = new ApiError(502, error.message || "Audio transcode failed.", {
+          code: "AUDIO_TRANSCODE_FAILED",
+          inputBytes: inputBuffer.length,
+          inputContentType: inputContentType || null,
+          ffmpegPath,
+          stderr
+        });
+        reject(wrapped);
+      })
+      .on("end", () => {
+        const outputBuffer = Buffer.concat(chunks);
+        console.log("[audioTranscode] transcode success", {
+          inputBytes: inputBuffer.length,
+          outputBytes: outputBuffer.length
+        });
+        resolve(outputBuffer);
+      })
       .pipe()
       .on("data", (chunk) => chunks.push(chunk))
       .on("error", reject);

@@ -1,4 +1,7 @@
+import axios from "axios";
+
 import { synthesizeSpeech } from "../voice/tts/index.js";
+import { synthesizeSpeechWithKie } from "../voice/tts/kie.js";
 import { resolveLiveTtsProvider, getTtsRuntimeSummary } from "../voice/tts/provider.js";
 
 // Module-level start time so the runtime endpoint can report uptime.
@@ -110,6 +113,89 @@ export async function ttsHealthCheck(req, res) {
       statusCode: error.statusCode || error.details?.providerStatus || null,
       details: sanitizeDetails(error.details),
       runtime
+    });
+  }
+}
+
+/**
+ * GET /api/health/kie-credit - checks Kie account credit without exposing secrets.
+ */
+export async function kieCreditHealthCheck(req, res) {
+  if (!process.env.KIE_API_KEY) {
+    return res.status(503).json({
+      success: false,
+      statusCode: 500,
+      errorMessage: "KIE_API_KEY is missing.",
+      providerBody: null
+    });
+  }
+
+  const baseUrl = String(process.env.KIE_BASE_URL || "https://api.kie.ai").replace(/\/+$/, "");
+
+  try {
+    const response = await axios.get(`${baseUrl}/api/v1/chat/credit`, {
+      headers: {
+        Authorization: `Bearer ${process.env.KIE_API_KEY}`,
+        Accept: "application/json"
+      },
+      validateStatus: () => true,
+      timeout: 30000
+    });
+
+    if (response.status < 200 || response.status >= 300) {
+      return res.status(503).json({
+        success: false,
+        statusCode: response.status,
+        errorMessage: response.statusText || "Kie credit check failed.",
+        providerBody: sanitizeDetails(response.data)
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      credits: sanitizeDetails(response.data)
+    });
+  } catch (error) {
+    return res.status(503).json({
+      success: false,
+      statusCode: error.response?.status || 502,
+      errorMessage: error.message,
+      providerBody: sanitizeDetails(error.response?.data || null)
+    });
+  }
+}
+
+/**
+ * POST /api/health/kie-tts - proves Kie TTS standalone:
+ * create task -> poll -> download -> transcode. It does not touch Twilio/Deepgram/LLMs.
+ */
+export async function kieTtsHealthCheck(req, res) {
+  const text = String(req.body?.text || "Hello testing");
+
+  try {
+    const audio = await synthesizeSpeechWithKie({ text });
+    const diagnostics = audio.kieTtsDiagnostics || {};
+
+    return res.status(200).json({
+      success: true,
+      provider: "kie",
+      taskId: diagnostics.taskId || null,
+      recordId: diagnostics.recordId || null,
+      finalState: diagnostics.finalState || "success",
+      audioUrlFound: diagnostics.audioUrlFound === true,
+      downloadedBytes: diagnostics.downloadedBytes || null,
+      contentType: diagnostics.contentType || null,
+      transcodedBytes: diagnostics.transcodedBytes || audio.length,
+      twilioReady: diagnostics.twilioReady === true,
+      elapsedMs: diagnostics.elapsedMs || null
+    });
+  } catch (error) {
+    return res.status(error.statusCode || 503).json({
+      success: false,
+      provider: "kie",
+      errorCode: error.details?.code || error.code || "KIE_TTS_FAILED",
+      errorMessage: error.message,
+      details: sanitizeDetails(error.details || null)
     });
   }
 }

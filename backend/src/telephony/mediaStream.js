@@ -43,9 +43,26 @@ export function sendAudioToTwilio(ws, streamSid, base64Payload) {
 }
 
 async function streamAudioBufferToTwilio(ws, session, audioBuffer) {
+  console.log("[Twilio Outbound Audio] stream requested", {
+    streamSid: session.streamSid,
+    callSid: session.callSid,
+    wsReadyState: ws.readyState,
+    audioBytes: audioBuffer?.length || 0
+  });
+
+  if (ws.readyState !== WebSocket.OPEN) {
+    console.warn("[Twilio Outbound Audio] cannot stream because WebSocket is not open", {
+      streamSid: session.streamSid,
+      callSid: session.callSid,
+      readyState: ws.readyState
+    });
+    return;
+  }
+
   const playbackId = session.playbackId + 1;
   session.playbackId = playbackId;
   session.speaking = true;
+  let chunksSent = 0;
 
   try {
     for (let offset = 0; offset < audioBuffer.length; offset += TWILIO_MULAW_20MS_BYTES) {
@@ -53,8 +70,26 @@ async function streamAudioBufferToTwilio(ws, session, audioBuffer) {
 
       const chunk = audioBuffer.subarray(offset, offset + TWILIO_MULAW_20MS_BYTES);
       sendAudioToTwilio(ws, session.streamSid, chunk.toString("base64"));
+      chunksSent += 1;
       await delay(20);
     }
+
+    if (!session.closed && session.playbackId === playbackId && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        event: "mark",
+        streamSid: session.streamSid,
+        mark: {
+          name: `echo-${Date.now()}`
+        }
+      }));
+    }
+
+    console.log("[Twilio Outbound Audio] stream completed", {
+      streamSid: session.streamSid,
+      callSid: session.callSid,
+      audioBytes: audioBuffer.length,
+      chunksSent
+    });
   } finally {
     if (session.playbackId === playbackId) {
       session.speaking = false;
@@ -101,26 +136,25 @@ async function echoTranscript(ws, session, rawText, source = "final") {
     return;
   }
 
-  // Dedupe: the same text can arrive as a debounced interim AND a final (or twice from
-  // Deepgram). Don't echo identical text again within 3s.
-  const now = Date.now();
-  if (
-    session.lastEchoedTranscript === transcript &&
-    now - session.lastEchoedAt < 3000
-  ) {
-    console.log("[EchoBot] Duplicate transcript skipped", {
+  if (session.echoInProgress) {
+    console.log("[EchoBot] Echo already in progress; skipping new Kie task", {
       streamSid: session.streamSid,
-      source,
+      callSid: session.callSid,
       text: transcript
     });
     return;
   }
 
-  // Prevent overlapping echoes (e.g. the debounce timer firing while a previous echo
-  // is still streaming).
-  if (session.echoInProgress) {
-    console.log("[EchoBot] Echo already in progress; skipping overlapping echo", {
+  // Dedupe: the same text can arrive as a debounced interim AND a final (or twice from
+  // Deepgram). Don't echo identical text again within 5s.
+  const now = Date.now();
+  if (
+    session.lastEchoedTranscript === transcript &&
+    now - session.lastEchoedAt < 5000
+  ) {
+    console.log("[EchoBot] Duplicate transcript skipped", {
       streamSid: session.streamSid,
+      callSid: session.callSid,
       source,
       text: transcript
     });
@@ -174,13 +208,18 @@ async function echoTranscript(ws, session, rawText, source = "final") {
       return;
     }
 
+    console.log("[EchoBot] Streaming TTS audio to caller", {
+      streamSid: session.streamSid,
+      callSid: session.callSid,
+      bytes: audio?.length || 0,
+      wsReadyState: ws.readyState
+    });
+
     await streamAudioBufferToTwilio(ws, session, audio);
 
     console.log("[EchoBot] Audio streamed back to caller", {
       streamSid: session.streamSid,
-      callSid: session.callSid,
-      source,
-      bytes: audio?.length || 0
+      callSid: session.callSid
     });
   } catch (error) {
     // Echo failure is non-fatal: log the real error, keep the call open, do NOT play
@@ -314,7 +353,7 @@ async function handleStart(ws, session, message) {
           clearTimeout(session.interimEchoTimer);
         }
 
-        const delayMs = Number(process.env.ECHO_INTERIM_AFTER_MS || 1000);
+        const delayMs = Number(process.env.ECHO_INTERIM_AFTER_MS || 1500);
         session.interimEchoTimer = setTimeout(() => {
           const latest = session.latestInterimTranscript?.trim();
           if (!latest) return;
