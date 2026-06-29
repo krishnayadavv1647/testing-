@@ -421,7 +421,16 @@ async function handleStart(ws, session, message) {
         await echoTranscript(ws, session, text, "final");
       },
 
-      onClose: async () => {
+      onClose: async (event = {}) => {
+        if (event.sttFailed) {
+          console.error("[EchoBot] Cannot echo because Deepgram STT connection failed.", {
+            streamSid: session.streamSid,
+            callSid: session.callSid,
+            latestInterimTranscript: session.latestInterimTranscript || null
+          });
+          return;
+        }
+
         // Deepgram closed (e.g. code 1005) before emitting a final transcript. As a last
         // resort, echo the latest interim so the caller still hears their words repeated.
         if (process.env.ECHO_INTERIM_ON_CLOSE === "true") {
