@@ -137,6 +137,19 @@ export function transcodeToMulaw8k(inputBuffer, { contentType = "", inputFormat 
           inputBytes: inputBuffer.length,
           outputBytes: outputBuffer.length
         });
+
+        console.log("[audioTranscode] output sanity", {
+          outputBytes: outputBuffer.length,
+          firstBytesHex: outputBuffer.subarray(0, 12).toString("hex")
+        });
+
+        if (outputBuffer.subarray(0, 4).toString("hex") === "52494646") {
+          const error = new Error("Transcoded audio is WAV/RIFF container, but Twilio Media Stream requires raw mulaw.");
+          error.code = "AUDIO_TRANSCODE_WRONG_CONTAINER";
+          reject(error);
+          return;
+        }
+
         resolve(outputBuffer);
       })
       .pipe()

@@ -6,10 +6,11 @@ import { createDeepgramLiveTranscriber } from "../voice/stt/index.js";
 import { synthesizeSpeech } from "../voice/tts/index.js";
 import { getTtsRuntimeSummary } from "../voice/tts/provider.js";
 
-const TWILIO_MULAW_20MS_BYTES = 160;
+const TWILIO_MULAW_CHUNK_SIZE = 160;
+const TWILIO_CHUNK_DELAY_MS = 20;
 const TTS_FAILURE_FALLBACK_MESSAGE = "We're experiencing a technical issue, please try again shortly.";
 
-function delay(ms) {
+function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -43,14 +44,28 @@ export function sendAudioToTwilio(ws, streamSid, base64Payload) {
 }
 
 async function streamAudioBufferToTwilio(ws, session, audioBuffer) {
+  if (!audioBuffer || !Buffer.isBuffer(audioBuffer) || audioBuffer.length === 0) {
+    console.warn("[Twilio Outbound Audio] empty or invalid audio buffer", {
+      streamSid: session.streamSid,
+      callSid: session.callSid,
+      isBuffer: Buffer.isBuffer(audioBuffer),
+      audioBytes: audioBuffer?.length || 0
+    });
+    return;
+  }
+
+  const expectedChunks = Math.ceil(audioBuffer.length / TWILIO_MULAW_CHUNK_SIZE);
+
   console.log("[Twilio Outbound Audio] stream requested", {
     streamSid: session.streamSid,
     callSid: session.callSid,
     wsReadyState: ws.readyState,
-    audioBytes: audioBuffer?.length || 0
+    audioBytes: audioBuffer.length,
+    chunkSize: TWILIO_MULAW_CHUNK_SIZE,
+    expectedChunks
   });
 
-  if (ws.readyState !== WebSocket.OPEN) {
+  if (ws.readyState !== 1) {
     console.warn("[Twilio Outbound Audio] cannot stream because WebSocket is not open", {
       streamSid: session.streamSid,
       callSid: session.callSid,
@@ -59,42 +74,69 @@ async function streamAudioBufferToTwilio(ws, session, audioBuffer) {
     return;
   }
 
-  const playbackId = session.playbackId + 1;
-  session.playbackId = playbackId;
-  session.speaking = true;
   let chunksSent = 0;
 
-  try {
-    for (let offset = 0; offset < audioBuffer.length; offset += TWILIO_MULAW_20MS_BYTES) {
-      if (session.closed || session.playbackId !== playbackId || ws.readyState !== WebSocket.OPEN) break;
-
-      const chunk = audioBuffer.subarray(offset, offset + TWILIO_MULAW_20MS_BYTES);
-      sendAudioToTwilio(ws, session.streamSid, chunk.toString("base64"));
-      chunksSent += 1;
-      await delay(20);
-    }
-
-    if (!session.closed && session.playbackId === playbackId && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        event: "mark",
+  for (let offset = 0; offset < audioBuffer.length; offset += TWILIO_MULAW_CHUNK_SIZE) {
+    if (ws.readyState !== 1) {
+      console.warn("[Twilio Outbound Audio] WebSocket closed during stream", {
         streamSid: session.streamSid,
-        mark: {
-          name: `echo-${Date.now()}`
-        }
-      }));
+        callSid: session.callSid,
+        offset,
+        chunksSent,
+        readyState: ws.readyState
+      });
+      break;
     }
 
-    console.log("[Twilio Outbound Audio] stream completed", {
+    const chunk = audioBuffer.subarray(
+      offset,
+      Math.min(offset + TWILIO_MULAW_CHUNK_SIZE, audioBuffer.length)
+    );
+
+    ws.send(JSON.stringify({
+      event: "media",
       streamSid: session.streamSid,
-      callSid: session.callSid,
-      audioBytes: audioBuffer.length,
-      chunksSent
-    });
-  } finally {
-    if (session.playbackId === playbackId) {
-      session.speaking = false;
+      media: {
+        payload: chunk.toString("base64")
+      }
+    }));
+
+    chunksSent += 1;
+
+    if (chunksSent === 1 || chunksSent % 20 === 0 || chunksSent === expectedChunks) {
+      console.log("[Twilio Outbound Audio] chunk sent", {
+        streamSid: session.streamSid,
+        callSid: session.callSid,
+        chunksSent,
+        expectedChunks,
+        chunkBytes: chunk.length
+      });
     }
+
+    await sleep(TWILIO_CHUNK_DELAY_MS);
   }
+
+  const markName = `echo-${Date.now()}`;
+
+  if (ws.readyState === 1) {
+    ws.send(JSON.stringify({
+      event: "mark",
+      streamSid: session.streamSid,
+      mark: {
+        name: markName
+      }
+    }));
+  }
+
+  console.log("[Twilio Outbound Audio] stream completed", {
+    streamSid: session.streamSid,
+    callSid: session.callSid,
+    audioBytes: audioBuffer.length,
+    chunksSent,
+    expectedChunks,
+    markName,
+    wsReadyState: ws.readyState
+  });
 }
 
 // Echo the caller's words back via TTS. Shared by the final-transcript, interim-debounce,
@@ -419,26 +461,22 @@ async function handleStart(ws, session, message) {
 }
 
 function handleMedia(ws, session, message) {
-  if (session.speaking) {
-    session.playbackId += 1;
-    sendClearToTwilio(ws, session.streamSid);
-    session.speaking = false;
-  }
-
   session.mediaFrameCount = (session.mediaFrameCount || 0) + 1;
+  const payload = message.media?.payload;
 
-  // Log first frame and every 50th to confirm caller audio is reaching the backend.
-  if (session.mediaFrameCount === 1 || session.mediaFrameCount % 50 === 0) {
+  if (
+    process.env.DEBUG_TWILIO_MEDIA_EVENTS === "true" &&
+    (session.mediaFrameCount === 1 || session.mediaFrameCount % 1000 === 0)
+  ) {
     console.log(`[MediaStream:${session.streamSid}] Twilio media frames received`, {
       count: session.mediaFrameCount,
-      hasPayload: Boolean(message.media?.payload),
-      payloadLength: message.media?.payload?.length || 0,
+      hasPayload: Boolean(payload),
+      payloadLength: payload?.length || 0,
       hasDeepgram: Boolean(session.deepgram),
       callSid: session.callSid
     });
   }
 
-  const payload = message.media?.payload;
   if (!payload || !session.deepgram) return;
 
   session.deepgram.sendAudio(Buffer.from(payload, "base64"));
@@ -469,6 +507,15 @@ function handleMessage(ws, session, rawMessage) {
 
   if (message.event === "media") {
     handleMedia(ws, session, message);
+    return;
+  }
+
+  if (message.event === "mark") {
+    console.log("[Twilio Outbound Audio] mark received", {
+      streamSid: session.streamSid,
+      callSid: session.callSid,
+      mark: message.mark
+    });
     return;
   }
 
